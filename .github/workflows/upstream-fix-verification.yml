@@ -1,0 +1,102 @@
+{
+  "name": "Upstream fix verification",
+  "on": {
+    "push": {
+      "branches": [
+        "verify/upstream-fixes-20261018"
+      ]
+    }
+  },
+  "permissions": {
+    "contents": "read"
+  },
+  "jobs": {
+    "verify": {
+      "name": "${{ matrix.lane }}",
+      "runs-on": "ubuntu-latest",
+      "timeout-minutes": 40,
+      "strategy": {
+        "fail-fast": false,
+        "max-parallel": 3,
+        "matrix": {
+          "include": [
+            {
+              "lane": "cdk-selection",
+              "repository": "mmalmi/cdk",
+              "ref": "d807412a10424d21c02f91783a60cec6b0c37ee2",
+              "rust": "1.99.0",
+              "command": "cargo test --locked -p cdk --lib --no-default-features --features wallet\ncargo clippy --locked -p cdk --lib --tests --no-default-features --features wallet -- -D warnings\ncargo fmt --all -- --check"
+            },
+            {
+              "lane": "cdk-http",
+              "repository": "mmalmi/cdk",
+              "ref": "d1db1d4bb20ac0de89fd725edfaf04b9e755af54",
+              "rust": "1.99.0",
+              "command": "cargo test --locked -p cdk-http-client\ncargo test --locked -p cdk-http-client --no-default-features --features reqwest\ncargo clippy --locked -p cdk-http-client --all-targets -- -D warnings\ncargo clippy --locked -p cdk -p cdk-http-client --all-targets --no-default-features --features cdk/wallet,cdk-http-client/reqwest -- -D warnings\ncargo fmt --all -- --check"
+            },
+            {
+              "lane": "cdk-sqlite",
+              "repository": "mmalmi/cdk",
+              "ref": "ae72a85f34f497eaada1854ae1e322c7b335a6c8",
+              "rust": "1.99.0",
+              "command": "cargo test --locked -p cdk-sqlite -p cdk-sql-common --lib\ncargo clippy --locked -p cdk-sqlite -p cdk-sql-common -p cdk-postgres --all-targets -- -D warnings\ncargo fmt --all -- --check"
+            },
+            {
+              "lane": "spilman-http",
+              "repository": "mmalmi/cashu_spilman_channels",
+              "ref": "dd4aa5d767ef3c19ada94c3ba61d4ca49107af81",
+              "rust": "1.94.0",
+              "command": "cargo test --locked -p cdk-spilman --all-features\ncargo clippy --locked -p cdk-spilman --all-features --all-targets -- -D warnings\ncargo fmt --all -- --check"
+            },
+            {
+              "lane": "bitreq",
+              "repository": "mmalmi/corepc",
+              "ref": "518ed7a50a842d4b9ae47099612d5569dc3227c2",
+              "rust": "1.94.1",
+              "command": "cp Cargo-recent.lock Cargo.lock\ncp bitreq/src/response.rs /tmp/response-after.rs\ngit show HEAD^:bitreq/src/response.rs > bitreq/src/response.rs\nprintf '\\n#[cfg(all(test, feature = \"async\"))]\\nmod tests;\\n' >> bitreq/src/response.rs\nif cargo test --locked -p bitreq --lib --features async oversized_content_length_is_rejected_without_body_bytes > /tmp/bitreq-before.log 2>&1; then\n  cat /tmp/bitreq-before.log\n  exit 1\nfi\ncat /tmp/bitreq-before.log\npython3 -c 'from pathlib import Path; assert \"test result: FAILED\" in Path(\"/tmp/bitreq-before.log\").read_text()'\ncp /tmp/response-after.rs bitreq/src/response.rs\ncargo test --locked -p bitreq --all-features\ncargo check --locked -p bitreq --no-default-features\ncargo clippy --locked -p bitreq --all-features --all-targets -- -D warnings\nrustup toolchain install nightly-2025-09-12 --profile minimal --component rustfmt\ncargo +nightly-2025-09-12 fmt --all -- --check"
+            }
+          ]
+        }
+      },
+      "env": {
+        "CARGO_INCREMENTAL": "0",
+        "CARGO_PROFILE_DEV_DEBUG": "0",
+        "CARGO_PROFILE_TEST_DEBUG": "0",
+        "CARGO_BUILD_JOBS": "2"
+      },
+      "steps": [
+        {
+          "uses": "actions/checkout@v4",
+          "with": {
+            "repository": "${{ matrix.repository }}",
+            "ref": "${{ matrix.ref }}",
+            "path": "source",
+            "fetch-depth": 2,
+            "persist-credentials": false
+          }
+        },
+        {
+          "name": "System dependencies",
+          "run": "sudo apt-get update -qq && sudo apt-get install -y protobuf-compiler libssl-dev pkg-config"
+        },
+        {
+          "name": "Rust",
+          "working-directory": "source",
+          "run": "rustup toolchain install ${{ matrix.rust }} --profile minimal --component clippy,rustfmt\nrustup override set ${{ matrix.rust }}"
+        },
+        {
+          "uses": "Swatinem/rust-cache@v2",
+          "with": {
+            "workspaces": "source -> target",
+            "key": "upstream-${{ matrix.lane }}"
+          }
+        },
+        {
+          "name": "Verify exact source and run checks",
+          "working-directory": "source",
+          "run": "git rev-parse HEAD\n${{ matrix.command }}"
+        }
+      ]
+    }
+  }
+}
