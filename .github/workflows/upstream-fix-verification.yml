@@ -21,16 +21,8 @@
         "matrix": {
           "include": [
             {
-              "lane": "cdk-selection",
-              "ref": "d807412a10424d21c02f91783a60cec6b0c37ee2"
-            },
-            {
-              "lane": "cdk-http",
-              "ref": "1b15d37916d86981bc5462f929b6250fc5ad0698"
-            },
-            {
               "lane": "cdk-sqlite",
-              "ref": "fa56bf7a63624f54882d6887ec7aef4bcf18c96a"
+              "ref": "9db2ce3fb374f7b599a57d20a268cb48ded40648"
             }
           ]
         }
@@ -70,7 +62,7 @@
           "uses": "Swatinem/rust-cache@v2",
           "with": {
             "workspaces": "source -> target",
-            "key": "upstream-${{ matrix.lane }}"
+            "key": "upstream-cdk-selection"
           }
         },
         {
