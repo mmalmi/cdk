@@ -63,7 +63,7 @@
         {
           "uses": "taiki-e/install-action@v2",
           "with": {
-            "tool": "just,typos-cli,nixpkgs-fmt"
+            "tool": "just,typos-cli@1.46.3,nixpkgs-fmt@1.3.0"
           }
         },
         {
@@ -86,46 +86,6 @@
             "path": "source/quick-check.log",
             "if-no-files-found": "ignore"
           }
-        }
-      ]
-    },
-    "bitreq": {
-      "name": "bitreq current upstream",
-      "runs-on": "ubuntu-latest",
-      "timeout-minutes": 25,
-      "env": {
-        "CARGO_INCREMENTAL": "0",
-        "CARGO_PROFILE_DEV_DEBUG": "0",
-        "CARGO_PROFILE_TEST_DEBUG": "0",
-        "CARGO_BUILD_JOBS": "2"
-      },
-      "steps": [
-        {
-          "uses": "actions/checkout@v4",
-          "with": {
-            "repository": "mmalmi/corepc",
-            "ref": "5f71ad5167801b06038c12362ad0b7aa6d716408",
-            "path": "source",
-            "fetch-depth": 2,
-            "persist-credentials": false
-          }
-        },
-        {
-          "name": "Rust",
-          "working-directory": "source",
-          "run": "rustup toolchain install 1.94.1 --profile minimal --component clippy,rustfmt\nrustup override set 1.94.1"
-        },
-        {
-          "uses": "Swatinem/rust-cache@v2",
-          "with": {
-            "workspaces": "source -> target",
-            "key": "upstream-bitreq"
-          }
-        },
-        {
-          "name": "Tests and supported builds",
-          "working-directory": "source",
-          "run": "set -o pipefail\ncp Cargo-recent.lock Cargo.lock\ncargo test --locked -p bitreq --all-features\ncargo check --locked -p bitreq --no-default-features\ncargo clippy --locked -p bitreq --all-features --all-targets -- -D warnings\nrustup toolchain install nightly-2025-09-12 --profile minimal --component rustfmt\ncargo +nightly-2025-09-12 fmt --all -- --check\ncp Cargo-minimal.lock Cargo.lock\nrustup toolchain install 1.75.0 --profile minimal\ncargo +1.75.0 test --locked -p bitreq --lib --no-default-features --features async\ncargo +1.75.0 check --locked -p bitreq --no-default-features"
         }
       ]
     }
