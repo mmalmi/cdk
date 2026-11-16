@@ -3,6 +3,7 @@
 //! This module contains generic tests for wallet database implementations.
 //! These tests can be used to verify any wallet database implementation
 //! by using the `wallet_db_test!` macro.
+
 #![allow(clippy::unwrap_used, clippy::missing_panics_doc)]
 
 use std::collections::{BTreeMap, HashMap};
@@ -20,6 +21,59 @@ use crate::wallet::{
     MeltQuote, MintQuote, OperationData, ProofInfo, SwapOperationData, SwapSagaState, Transaction,
     TransactionDirection, TransactionStatus, WalletSaga, WalletSagaState,
 };
+
+mod kv_bounds;
+mod output_preparation;
+mod saga_completion;
+pub use self::output_preparation::{output_preparation_concurrent, output_preparation_contract};
+pub use kv_bounds::kv_read_bounded_contract;
+pub use saga_completion::{complete_saga_concurrent, complete_saga_contract};
+mod melt_completion;
+mod melt_completion_fixture;
+mod melt_completion_validation;
+pub use self::melt_completion::{
+    complete_melt_concurrent, complete_melt_contract, complete_melt_exact_snapshots,
+};
+pub use self::melt_completion_fixture::melt_completion_fixture;
+pub use self::melt_completion_validation::{complete_melt_fee_budget, complete_melt_invalid};
+mod issue_retirement;
+pub use self::issue_retirement::{
+    issue_retirement_concurrent, issue_retirement_contract, issue_retirement_fixture,
+    issue_retirement_invalid, issue_retirement_proofs,
+};
+mod issue_acquisition;
+pub use self::issue_acquisition::{
+    issue_acquisition_concurrent, issue_acquisition_contract, issue_acquisition_fixture,
+    issue_acquisition_invalid,
+};
+mod melt_acquisition;
+mod melt_acquisition_fixture;
+pub use self::melt_acquisition::{
+    acquire_melt, acquire_melt_batch, acquire_melt_competing, acquire_melt_concurrent,
+    acquire_melt_exhausted_version, acquire_melt_invalid, acquire_melt_payment_evidence,
+};
+pub use self::melt_acquisition_fixture::melt_acquisition_fixture;
+mod incoming_history;
+mod proof_changes;
+mod proof_pages;
+mod refund_history;
+mod send_history;
+pub use self::incoming_history::{
+    retire_incoming_transactions, retire_incoming_transactions_concurrent,
+};
+pub use self::proof_changes::{
+    compare_and_swap_proofs, compare_and_swap_proofs_concurrent, compare_and_swap_proofs_fields,
+    compare_and_swap_proofs_saga_guard,
+};
+pub use self::proof_pages::{
+    proofs_created_by_operation_cursor_survives_deletion, proofs_created_by_operation_page_limits,
+    proofs_created_by_operation_pages,
+};
+pub use self::refund_history::{
+    refund_receipts_require_parent_and_owner, refund_receipts_roundtrip_and_retire,
+    refund_receipts_validate_role,
+};
+pub use self::send_history::{retire_send_transactions, retire_send_transactions_concurrent};
 
 /// Generate a unique test ID
 fn unique_id() -> String {
@@ -106,7 +160,7 @@ fn test_mint_quote(mint_url: MintUrl) -> MintQuote {
         Some(Amount::from(1000)),
         CurrencyUnit::Sat,
         "lnbc1000...".to_string(),
-        9999999999,
+        2_000_000_000,
         None,
     )
 }
@@ -121,7 +175,7 @@ fn test_melt_quote() -> MeltQuote {
         request: "lnbc1000...".to_string(),
         fee_reserve: Amount::from(10),
         state: cashu::MeltQuoteState::Unpaid,
-        expiry: 9999999999,
+        expiry: 2_000_000_000,
         payment_proof: None,
         estimated_blocks: None,
         fee_index: None,
@@ -135,6 +189,7 @@ fn test_melt_quote() -> MeltQuote {
 fn test_transaction(mint_url: MintUrl, direction: TransactionDirection) -> Transaction {
     let ys = vec![SecretKey::generate().public_key()];
     Transaction {
+        role: Default::default(),
         mint_url,
         direction,
         amount: Amount::from(100),
@@ -162,11 +217,9 @@ fn test_wallet_saga(mint_url: MintUrl) -> WalletSaga {
         mint_url,
         CurrencyUnit::Sat,
         OperationData::Swap(SwapOperationData {
+            checkpoint: None,
             input_amount: Amount::from(1000),
             output_amount: Amount::from(990),
-            counter_start: Some(0),
-            counter_end: Some(10),
-            blinded_messages: None,
         }),
     )
 }
@@ -1769,6 +1822,10 @@ macro_rules! wallet_db_test {
             add_and_get_proofs,
             get_proofs_in_transaction,
             update_proofs,
+            compare_and_swap_proofs,
+            compare_and_swap_proofs_concurrent,
+            compare_and_swap_proofs_saga_guard,
+            compare_and_swap_proofs_fields,
             update_proofs_state,
             filter_proofs_by_unit,
             filter_proofs_by_state,
@@ -1785,6 +1842,13 @@ macro_rules! wallet_db_test {
             list_transactions,
             filter_transactions_by_mint,
             remove_transaction,
+            retire_send_transactions,
+            retire_send_transactions_concurrent,
+            retire_incoming_transactions,
+            retire_incoming_transactions_concurrent,
+            refund_receipts_roundtrip_and_retire,
+            refund_receipts_require_parent_and_owner,
+            refund_receipts_validate_role,
             kvstore_write_and_read,
             kvstore_list,
             kvstore_update,
@@ -1792,6 +1856,22 @@ macro_rules! wallet_db_test {
             kvstore_namespace_isolation,
             add_and_get_saga,
             update_saga_optimistic_locking,
+            complete_melt_contract,
+            complete_melt_exact_snapshots,
+            complete_melt_concurrent,
+            complete_melt_invalid,
+            complete_melt_fee_budget,
+            acquire_melt,
+            acquire_melt_concurrent,
+            acquire_melt_batch,
+            acquire_melt_invalid,
+            acquire_melt_competing,
+            acquire_melt_exhausted_version,
+            acquire_melt_payment_evidence,
+            output_preparation_contract,
+            output_preparation_concurrent,
+            complete_saga_contract,
+            complete_saga_concurrent,
             delete_saga,
             get_incomplete_sagas,
             reserve_proofs,
@@ -1818,3 +1898,6 @@ macro_rules! wallet_db_test {
         }
     };
 }
+
+mod saga_pages;
+pub use saga_pages::incomplete_saga_pages;

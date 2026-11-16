@@ -127,6 +127,104 @@ pub enum Error {
     #[error("Amount zero")]
     AmountZero,
 
+    /// The selected transaction page exceeds its decoded-payload budget.
+    #[error("Transaction page payload exceeds {limit} bytes: {bytes}")]
+    TransactionPageTooLarge {
+        /// Conservative aggregate stored payload size of the selected rows.
+        bytes: u64,
+        /// Maximum accepted payload size.
+        limit: u64,
+    },
+
+    /// The selected operation proof page exceeds its stored-payload budget.
+    #[error("Proof page payload exceeds {limit} bytes: {bytes}")]
+    ProofPageTooLarge {
+        /// Conservative aggregate stored payload size of the selected rows.
+        bytes: u64,
+        /// Maximum accepted payload size.
+        limit: u64,
+    },
+
+    /// The selected mint quote page exceeds its stored-payload budget.
+    #[error("Mint quote page payload exceeds {limit} bytes: {bytes}")]
+    MintQuotePageTooLarge {
+        /// Aggregate stored payload size of the selected rows.
+        bytes: u64,
+        /// Maximum accepted payload size.
+        limit: u64,
+    },
+
+    /// Stored quote data exceeds the caller-owned comparison budget.
+    #[error("Quote comparison payload exceeds {limit} bytes: {bytes}")]
+    QuoteTooLarge {
+        /// Aggregate stored payload size in bytes.
+        bytes: u64,
+        /// Maximum accepted payload size for this comparison.
+        limit: u64,
+    },
+
+    /// Stored mint keys exceed the exact-keyset comparison budget.
+    #[error("Stored keyset payload exceeds {limit} bytes: {bytes}")]
+    KeysetTooLarge {
+        /// Stored key payload size in bytes.
+        bytes: u64,
+        /// Maximum accepted payload size.
+        limit: u64,
+    },
+
+    /// A mint metadata read exceeds its row or stored-payload budget.
+    #[error("Mint metadata read exceeds budget: {records}/{max_records} records, {bytes}/{max_bytes} stored bytes")]
+    MintMetadataReadTooLarge {
+        /// Rows observed, capped at one more than the configured row limit.
+        records: u64,
+        /// Stored bytes and conservative row overhead in the observed rows.
+        bytes: u64,
+        /// Maximum rows accepted by this read.
+        max_records: u32,
+        /// Maximum aggregate stored bytes accepted by this read.
+        max_bytes: u32,
+    },
+
+    /// The selected operation page exceeds its stored-payload budget.
+    #[error("Saga page payload exceeds {limit} bytes: {bytes}")]
+    SagaPageTooLarge {
+        /// Aggregate stored payload size of the selected rows.
+        bytes: u64,
+        /// Maximum accepted payload size.
+        limit: u32,
+    },
+
+    /// A saved operation exceeds the caller's inspection budget.
+    #[error("Saga payload exceeds {limit} bytes: {bytes}")]
+    SagaTooLarge {
+        /// Conservative aggregate stored payload size.
+        bytes: u64,
+        /// Maximum accepted payload size.
+        limit: u32,
+    },
+
+    /// A key-value record exceeds the caller's read budget.
+    #[error("Key-value payload exceeds {limit} bytes: {bytes}")]
+    KvValueTooLarge {
+        /// Stored payload size in bytes.
+        bytes: u64,
+        /// Maximum accepted payload size.
+        limit: u32,
+    },
+
+    /// A proof inventory cannot fit the caller's read budget.
+    #[error("Proof inventory exceeds {max_proofs} proofs or {max_bytes} bytes: at least {proofs} proofs, {bytes} bytes")]
+    ProofInventoryTooLarge {
+        /// Number of inspected rows, capped at one beyond the proof limit.
+        proofs: u64,
+        /// Aggregate stored payload size of those rows.
+        bytes: u64,
+        /// Maximum accepted number of proofs.
+        max_proofs: u32,
+        /// Maximum accepted stored payload size.
+        max_bytes: u32,
+    },
+
     /// DHKE error
     #[error(transparent)]
     DHKE(#[from] crate::dhke::Error),

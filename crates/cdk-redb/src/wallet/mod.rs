@@ -28,6 +28,15 @@ use crate::wallet::migrations::{
     migrate_01_to_02, migrate_02_to_03, migrate_03_to_04, migrate_04_to_05, migrate_05_to_06,
 };
 
+mod issue_acquisition;
+mod issue_retirement;
+mod melt_acquisition;
+mod melt_completion;
+mod output_preparation;
+mod proof_changes;
+mod saga_completion;
+mod send_history;
+
 mod migrations;
 
 // <Mint_url, Info>
@@ -178,6 +187,7 @@ impl WalletRedbDatabase {
                         let _ = write_txn.open_table(PROOFS_TABLE)?;
                         let _ = write_txn.open_table(KEYSET_COUNTER)?;
                         let _ = write_txn.open_table(TRANSACTIONS_TABLE)?;
+                        let _ = write_txn.open_table(SAGAS_TABLE)?;
                         let _ = write_txn.open_table(KEYSET_U32_MAPPING)?;
                         let _ = write_txn.open_table(KV_STORE_TABLE)?;
                         let _ = write_txn.open_table(P2PK_SIGNING_KEYS_TABLE)?;
@@ -476,7 +486,10 @@ impl WalletDatabase<database::Error> for WalletRedbDatabase {
             .map_err(Error::from)?;
 
         if let Some(transaction) = table.get(transaction_id.as_slice()).map_err(Error::from)? {
-            return Ok(serde_json::from_str(transaction.value()).map_err(Error::from)?);
+            return Ok(Some(decode_transaction(
+                transaction.value(),
+                transaction_id.as_slice(),
+            )?));
         }
 
         Ok(None)
@@ -495,22 +508,14 @@ impl WalletDatabase<database::Error> for WalletRedbDatabase {
             .open_table(TRANSACTIONS_TABLE)
             .map_err(Error::from)?;
 
-        let transactions: Vec<Transaction> = table
-            .iter()
-            .map_err(Error::from)?
-            .flatten()
-            .filter_map(|(_k, v)| {
-                let mut transaction = None;
-
-                if let Ok(tx) = serde_json::from_str::<Transaction>(v.value()) {
-                    if tx.matches_conditions(&mint_url, &direction, &unit) {
-                        transaction = Some(tx)
-                    }
-                }
-
-                transaction
-            })
-            .collect();
+        let mut transactions = Vec::new();
+        for entry in table.iter().map_err(Error::from)? {
+            let (key, value) = entry.map_err(Error::from)?;
+            let transaction = decode_transaction(value.value(), key.value())?;
+            if transaction.matches_conditions(&mint_url, &direction, &unit) {
+                transactions.push(transaction);
+            }
+        }
 
         Ok(transactions)
     }
@@ -556,6 +561,14 @@ impl WalletDatabase<database::Error> for WalletRedbDatabase {
         }
         write_txn.commit().map_err(Error::from)?;
         Ok(())
+    }
+
+    async fn compare_and_swap_proofs(
+        &self,
+        changes: Vec<cdk_common::database::wallet::ProofChange>,
+        expected_saga: Option<&wallet::WalletSaga>,
+    ) -> Result<bool, database::Error> {
+        self.apply_proof_changes(changes, expected_saga)
     }
 
     async fn update_proofs_state(
@@ -605,6 +618,7 @@ impl WalletDatabase<database::Error> for WalletRedbDatabase {
         )
     )]
     async fn add_transaction(&self, transaction: Transaction) -> Result<(), database::Error> {
+        transaction.validate_role().map_err(Error::from)?;
         let id = transaction.id();
         let write_txn = self.db.begin_write().map_err(Error::from)?;
         {
@@ -703,12 +717,41 @@ impl WalletDatabase<database::Error> for WalletRedbDatabase {
         Ok(())
     }
 
+    #[instrument(skip_all)]
+    async fn prepare_saga_outputs(
+        &self,
+        expected: Option<&wallet::WalletSaga>,
+        next: wallet::WalletSaga,
+        keyset: KeySet,
+        counter_start: u32,
+        counter_count: u32,
+        receipt: Option<Transaction>,
+    ) -> Result<bool, database::Error> {
+        self.commit_output_preparation(
+            expected,
+            next,
+            keyset,
+            counter_start,
+            counter_count,
+            receipt,
+        )
+    }
+
     #[instrument(skip(self), fields(keyset_id = %keyset_id))]
     async fn increment_keyset_counter(
         &self,
         keyset_id: &Id,
         count: u32,
     ) -> Result<u32, database::Error> {
+        if count == 0 {
+            let tx = self.db.begin_read().map_err(Error::from)?;
+            let table = tx.open_table(KEYSET_COUNTER).map_err(Error::from)?;
+            return Ok(table
+                .get(keyset_id.to_string().as_str())
+                .map_err(Error::from)?
+                .map(|v| v.value())
+                .unwrap_or(0));
+        }
         let write_txn = self.db.begin_write().map_err(Error::from)?;
         let new_counter = {
             let mut table = write_txn.open_table(KEYSET_COUNTER).map_err(Error::from)?;
@@ -1044,6 +1087,20 @@ impl WalletDatabase<database::Error> for WalletRedbDatabase {
     }
 
     #[instrument(skip(self))]
+    async fn retire_send_transactions(
+        &self,
+        expected: Vec<Transaction>,
+    ) -> Result<bool, database::Error> {
+        self.retire_token_history(expected, TransactionDirection::Outgoing)
+    }
+
+    async fn retire_incoming_transactions(
+        &self,
+        expected: Vec<Transaction>,
+    ) -> Result<bool, database::Error> {
+        self.retire_token_history(expected, TransactionDirection::Incoming)
+    }
+
     async fn remove_transaction(
         &self,
         transaction_id: TransactionId,
@@ -1141,6 +1198,32 @@ impl WalletDatabase<database::Error> for WalletRedbDatabase {
         Ok(updated)
     }
 
+    fn supports_atomic_melt_completion(&self) -> bool {
+        true
+    }
+
+    async fn complete_melt(
+        &self,
+        expected: &wallet::WalletSaga,
+        next: wallet::WalletSaga,
+        quote: &wallet::MeltQuote,
+    ) -> Result<bool, database::Error> {
+        self.complete_melt_transaction(expected, next, quote)
+    }
+
+    fn supports_atomic_saga_completion(&self) -> bool {
+        true
+    }
+
+    async fn complete_saga(
+        &self,
+        expected: &wallet::WalletSaga,
+        next: wallet::WalletSaga,
+        receipt: Transaction,
+    ) -> Result<bool, database::Error> {
+        self.commit_saga_receipt(expected, next, receipt)
+    }
+
     #[instrument(skip(self))]
     async fn delete_saga(&self, id: &uuid::Uuid) -> Result<(), database::Error> {
         let write_txn = self.db.begin_write().map_err(Error::from)?;
@@ -1151,6 +1234,36 @@ impl WalletDatabase<database::Error> for WalletRedbDatabase {
         }
         write_txn.commit().map_err(Error::from)?;
         Ok(())
+    }
+
+    async fn get_incomplete_saga_ids(
+        &self,
+        after: Option<cdk_common::database::wallet::SagaCursor>,
+        limit: u16,
+    ) -> Result<Vec<cdk_common::database::wallet::SagaCursor>, database::Error> {
+        use cdk_common::database::wallet::{validate_saga_page_request, SagaCursor};
+
+        validate_saga_page_request(after, limit)?;
+        let read_txn = self.db.begin_read().map_err(Error::from)?;
+        let table = read_txn.open_table(SAGAS_TABLE).map_err(Error::from)?;
+        let mut selected = std::collections::BinaryHeap::new();
+        // Redb stores the original JSON. Deserialize only its fixed-size header
+        // and retain the earliest bounded page; scanning time is still linear.
+        for entry in table.iter().map_err(Error::from)? {
+            let (key, value) = entry.map_err(Error::from)?;
+            let cursor: SagaCursor = serde_json::from_str(value.value())?;
+            validate_saga_page_request(Some(cursor), limit)?;
+            if key.value() != cursor.id.to_string() {
+                return Err(database::Error::InvalidDbResponse);
+            }
+            if after.is_none_or(|after| cursor > after) {
+                selected.push(cursor);
+                if selected.len() > usize::from(limit) {
+                    selected.pop();
+                }
+            }
+        }
+        Ok(selected.into_sorted_vec())
     }
 
     #[instrument(skip(self))]
@@ -1275,6 +1388,39 @@ impl WalletDatabase<database::Error> for WalletRedbDatabase {
             .collect();
 
         Ok(proofs)
+    }
+
+    #[instrument(skip_all)]
+    async fn acquire_melt(
+        &self,
+        saga: &wallet::WalletSaga,
+        quote: &wallet::MeltQuote,
+    ) -> Result<bool, database::Error> {
+        self.acquire_melt_transaction(saga, quote)
+    }
+
+    fn supports_atomic_issue_retirement(&self) -> bool {
+        true
+    }
+
+    async fn retire_issue(
+        &self,
+        expected: &wallet::WalletSaga,
+        quotes: &[MintQuote],
+        proofs: Option<Vec<cdk_common::database::wallet::ProofChange>>,
+    ) -> Result<bool, database::Error> {
+        self.retire_issue_transaction(expected, quotes, proofs)
+    }
+
+    async fn acquire_issue(
+        &self,
+        saga: &wallet::WalletSaga,
+        quotes: &[wallet::MintQuote],
+        keyset: KeySet,
+        counter_start: u32,
+        counter_count: u32,
+    ) -> Result<bool, database::Error> {
+        self.acquire_issue_transaction(saga, quotes, keyset, counter_start, counter_count)
     }
 
     #[instrument(skip(self))]
@@ -1488,6 +1634,33 @@ impl WalletDatabase<database::Error> for WalletRedbDatabase {
         Ok(result)
     }
 
+    #[instrument(skip_all)]
+    async fn kv_read_bounded(
+        &self,
+        primary_namespace: &str,
+        secondary_namespace: &str,
+        key: &str,
+        max_bytes: u32,
+    ) -> Result<Option<Vec<u8>>, database::Error> {
+        validate_kvstore_params(primary_namespace, secondary_namespace, Some(key))?;
+        let read_txn = self.db.begin_read().map_err(Error::from)?;
+        let table = read_txn.open_table(KV_STORE_TABLE).map_err(Error::from)?;
+        table
+            .get((primary_namespace, secondary_namespace, key))
+            .map_err(Error::from)?
+            .map(|value| {
+                let bytes = value.value().len() as u64;
+                if bytes > u64::from(max_bytes) {
+                    return Err(database::Error::KvValueTooLarge {
+                        bytes,
+                        limit: max_bytes,
+                    });
+                }
+                Ok(value.value().to_vec())
+            })
+            .transpose()
+    }
+
     #[instrument(skip(self))]
     async fn kv_list(
         &self,
@@ -1633,6 +1806,17 @@ impl WalletDatabase<database::Error> for WalletRedbDatabase {
     }
 }
 
+fn decode_transaction(value: &str, id: &[u8]) -> Result<Transaction, Error> {
+    let transaction: Transaction = serde_json::from_str(value)?;
+    transaction.validate_role()?;
+    if transaction.role == cdk_common::wallet::TransactionRole::SendRefund
+        && transaction.id().as_slice() != id
+    {
+        return Err(cdk_common::Error::InvalidTransactionRole.into());
+    }
+    Ok(transaction)
+}
+
 #[cfg(test)]
 mod test {
     use std::path::PathBuf;
@@ -1649,6 +1833,20 @@ mod test {
     }
 
     wallet_db_test!(provide_db);
+    wallet_db_test!(provide_db, incomplete_saga_pages);
+    wallet_db_test!(provide_db, kv_read_bounded_contract);
+    wallet_db_test!(
+        provide_db,
+        issue_retirement_contract,
+        issue_retirement_concurrent,
+        issue_retirement_invalid
+    );
+    wallet_db_test!(
+        provide_db,
+        issue_acquisition_contract,
+        issue_acquisition_invalid,
+        issue_acquisition_concurrent
+    );
 
     #[tokio::test]
     async fn increment_keyset_counter_returns_error_on_overflow() {

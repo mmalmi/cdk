@@ -54,7 +54,7 @@ impl<'a> FromSql<'a> for PgValue<'a> {
             } else {
                 0
             }),
-            types::Type::INT2 => PgValue::Integer(<i8 as FromSql>::from_sql(ty, raw)? as i64),
+            types::Type::INT2 => PgValue::Integer(<i16 as FromSql>::from_sql(ty, raw)? as i64),
             types::Type::INT4 => PgValue::Integer(<i32 as FromSql>::from_sql(ty, raw)? as i64),
             types::Type::INT8 => PgValue::Integer(<i64 as FromSql>::from_sql(ty, raw)?),
             types::Type::BIT_ARRAY | types::Type::BYTEA | types::Type::UNKNOWN => {
@@ -85,8 +85,8 @@ impl ToSql for PgValue<'_> {
             PgValue::Real(r) => r.to_sql(ty, out),
             PgValue::Integer(i) => match *ty {
                 types::Type::BOOL => (*i != 0).to_sql(ty, out),
-                types::Type::INT2 => (*i as i16).to_sql(ty, out),
-                types::Type::INT4 => (*i as i32).to_sql(ty, out),
+                types::Type::INT2 => i16::try_from(*i)?.to_sql(ty, out),
+                types::Type::INT4 => i32::try_from(*i)?.to_sql(ty, out),
                 _ => i.to_sql_checked(ty, out),
             },
         }
@@ -121,10 +121,53 @@ impl ToSql for PgValue<'_> {
             PgValue::Real(r) => r.to_sql_checked(ty, out),
             PgValue::Integer(i) => match *ty {
                 types::Type::BOOL => (*i != 0).to_sql_checked(ty, out),
-                types::Type::INT2 => (*i as i16).to_sql_checked(ty, out),
-                types::Type::INT4 => (*i as i32).to_sql_checked(ty, out),
+                types::Type::INT2 => i16::try_from(*i)?.to_sql_checked(ty, out),
+                types::Type::INT4 => i32::try_from(*i)?.to_sql_checked(ty, out),
                 _ => i.to_sql_checked(ty, out),
             },
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn int2_bounds_roundtrip_and_overflow_rejects() {
+        check_bounds(types::Type::INT2, i64::from(i16::MIN), i64::from(i16::MAX));
+    }
+
+    #[test]
+    fn int4_bounds_roundtrip_and_overflow_rejects() {
+        check_bounds(types::Type::INT4, i64::from(i32::MIN), i64::from(i32::MAX));
+    }
+
+    fn check_bounds(ty: types::Type, min: i64, max: i64) {
+        for checked in [false, true] {
+            for value in [min, 0, max] {
+                let mut out = types::private::BytesMut::new();
+                let number = PgValue::Integer(value);
+                if checked {
+                    number.to_sql_checked(&ty, &mut out).unwrap();
+                } else {
+                    number.to_sql(&ty, &mut out).unwrap();
+                }
+                assert!(
+                    matches!(PgValue::from_sql(&ty, &out).unwrap(), PgValue::Integer(actual) if actual == value)
+                );
+            }
+            for value in [min - 1, max + 1] {
+                let mut out = types::private::BytesMut::new();
+                let number = PgValue::Integer(value);
+                let result = if checked {
+                    number.to_sql_checked(&ty, &mut out)
+                } else {
+                    number.to_sql(&ty, &mut out)
+                };
+                assert!(result.is_err());
+                assert!(out.is_empty());
+            }
         }
     }
 }

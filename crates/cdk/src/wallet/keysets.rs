@@ -31,6 +31,7 @@ impl Wallet {
                     .await
                 {
                     Ok(m) => m,
+                    Err(error @ Error::MintMetadataTooLarge { .. }) => return Err(error),
                     Err(e) => match self.metadata_cache.get_cached() {
                         Some(m) => {
                             tracing::warn!(
@@ -359,7 +360,7 @@ mod tests {
         // swap outputs. If inactive keysets are not properly loaded, this
         // call would fail with UnknownKeySet.
         let _prepared = saga
-            .prepare(proofs, ReceiveOptions::default(), None, None)
+            .prepare(proofs, ReceiveOptions::default(), None)
             .await
             .expect("prepare should succeed with inactive keyset proofs");
     }

@@ -158,6 +158,7 @@ where
                 }
             }
             HttpError::Timeout => Error::Timeout,
+            error @ HttpError::ResponseTooLarge { .. } => Error::HttpError(None, error.to_string()),
             HttpError::Connection(message)
             | HttpError::Serialization(message)
             | HttpError::Proxy(message)

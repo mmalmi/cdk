@@ -7,13 +7,15 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bitcoin::bip32::DerivationPath;
+use cdk_common::database::wallet::{ProofChange, TransactionCursor};
 use cdk_common::database::{ConversionError, Error, WalletDatabase};
 use cdk_common::mint_url::MintUrl;
 use cdk_common::nuts::{MeltQuoteState, MintQuoteState};
 use cdk_common::secret::Secret;
 use cdk_common::util::unix_time;
 use cdk_common::wallet::{
-    self, MintQuote, ProofInfo, Transaction, TransactionDirection, TransactionId, TransactionStatus,
+    self, MintQuote, ProofInfo, Transaction, TransactionDirection, TransactionId, TransactionRole,
+    TransactionStatus,
 };
 use cdk_common::{
     database, Amount, CurrencyUnit, Id, KeySet, KeySetInfo, Keys, MintInfo, PaymentMethod, Proof,
@@ -31,6 +33,31 @@ use crate::{
     column_as_nullable_string, column_as_number, column_as_string, unpack_into,
 };
 
+mod issue_acquisition;
+mod issue_retirement;
+mod keysets;
+mod keyvalue;
+mod kv_batch;
+mod melt_acquisition;
+mod melt_completion;
+mod melt_quotes;
+mod metadata;
+mod mint_quotes;
+mod output_preparation;
+mod proof_changes;
+mod proofs;
+mod query_budget;
+mod quote_records;
+mod saga_completion;
+mod sagas;
+mod send_history;
+pub mod storage_capacity;
+mod transactions;
+
+pub use self::kv_batch::WalletKvChange;
+pub use self::proofs::ProofOperationOwners;
+pub use self::transactions::TransactionProofReferences;
+
 #[rustfmt::skip]
 mod migrations {
     include!(concat!(env!("OUT_DIR"), "/migrations_wallet.rs"));
@@ -43,6 +70,11 @@ where
     RM: DatabasePool + 'static,
 {
     pool: Arc<Pool<RM>>,
+    saga_read_limit: Option<u32>,
+    proof_read_limit: Option<u32>,
+    quote_read_limit: Option<u32>,
+    bounded_transaction_reads: bool,
+    metadata_read_limits: Option<metadata::ReadLimits>,
 }
 
 impl<RM> SQLWalletDatabase<RM>
@@ -57,13 +89,23 @@ where
         let pool = Pool::new(db.into());
         Self::migrate(pool.get().await.map_err(|e| Error::Database(Box::new(e)))?).await?;
 
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            saga_read_limit: None,
+            proof_read_limit: None,
+            quote_read_limit: None,
+            bounded_transaction_reads: false,
+            metadata_read_limits: None,
+        })
     }
 
     /// Migrate [`WalletSqliteDatabase`]
     async fn migrate(conn: PooledResource<RM>) -> Result<(), Error> {
         let tx = ConnectionWithTransaction::new(conn).await?;
         migrate(&tx, RM::Connection::name(), migrations::MIGRATIONS).await?;
+        if RM::Connection::name() == "sqlite" {
+            storage_capacity::schema::validate_if_enabled(&tx).await?;
+        }
         // Update any existing keys with missing keyset_u32 values
         Self::add_keyset_u32(&tx).await?;
         tx.commit().await?;
@@ -148,6 +190,38 @@ impl<RM> WalletDatabase<database::Error> for SQLWalletDatabase<RM>
 where
     RM: DatabasePool + 'static,
 {
+    #[instrument(skip_all)]
+    async fn prepare_output_keyset(
+        &self,
+        operation_id: Uuid,
+        mint_url: MintUrl,
+        keyset: KeySet,
+    ) -> Result<(), database::Error> {
+        self.prepare_output_keys(operation_id, mint_url, keyset)
+            .await
+    }
+
+    #[instrument(skip_all)]
+    async fn prepare_saga_outputs(
+        &self,
+        expected: Option<&wallet::WalletSaga>,
+        next: wallet::WalletSaga,
+        keyset: KeySet,
+        counter_start: u32,
+        counter_count: u32,
+        receipt: Option<Transaction>,
+    ) -> Result<bool, database::Error> {
+        self.commit_output_preparation(
+            expected,
+            next,
+            keyset,
+            counter_start,
+            counter_count,
+            receipt,
+        )
+        .await
+    }
+
     #[instrument(skip(self))]
     async fn get_melt_quotes(&self) -> Result<Vec<wallet::MeltQuote>, database::Error> {
         let conn = self
@@ -191,31 +265,15 @@ where
             .get()
             .await
             .map_err(|e| Error::Database(Box::new(e)))?;
-        Ok(query(
-            r#"
-            SELECT
-                name,
-                pubkey,
-                version,
-                description,
-                description_long,
-                contact,
-                nuts,
-                icon_url,
-                motd,
-                urls,
-                mint_time,
-                tos_url
-            FROM
-                mint
-            WHERE mint_url = :mint_url
-            "#,
-        )?
-        .bind("mint_url", mint_url.to_string())
-        .fetch_one(&*conn)
+        metadata::load(
+            &*conn,
+            metadata::Scope::Mint(&mint_url),
+            self.metadata_read_limits,
+        )
         .await?
+        .pop()
         .map(sql_row_to_mint_info)
-        .transpose()?)
+        .transpose()
     }
 
     #[instrument(skip(self))]
@@ -225,38 +283,17 @@ where
             .get()
             .await
             .map_err(|e| Error::Database(Box::new(e)))?;
-        Ok(query(
-            r#"
-                SELECT
-                    name,
-                    pubkey,
-                    version,
-                    description,
-                    description_long,
-                    contact,
-                    nuts,
-                    icon_url,
-                    motd,
-                    urls,
-                    mint_time,
-                    tos_url,
-                    mint_url
-                FROM
-                    mint
-                "#,
-        )?
-        .fetch_all(&*conn)
-        .await?
-        .into_iter()
-        .map(|mut row| {
-            let url = column_as_string!(
-                row.pop().ok_or(ConversionError::MissingColumn(0, 1))?,
-                MintUrl::from_str
-            );
-
-            Ok((url, sql_row_to_mint_info(row).ok()))
-        })
-        .collect::<Result<HashMap<_, _>, Error>>()?)
+        metadata::load(&*conn, metadata::Scope::Mints, self.metadata_read_limits)
+            .await?
+            .into_iter()
+            .map(|mut row| {
+                let url = column_as_string!(
+                    row.pop().ok_or(ConversionError::MissingColumn(0, 1))?,
+                    MintUrl::from_str
+                );
+                Ok((url, sql_row_to_mint_info(row).ok()))
+            })
+            .collect()
     }
 
     #[instrument(skip(self))]
@@ -269,27 +306,15 @@ where
             .get()
             .await
             .map_err(|e| Error::Database(Box::new(e)))?;
-
-        let keysets = query(
-            r#"
-            SELECT
-                id,
-                unit,
-                active,
-                input_fee_ppk,
-                final_expiry
-            FROM
-                keyset
-            WHERE mint_url = :mint_url
-            "#,
-        )?
-        .bind("mint_url", mint_url.to_string())
-        .fetch_all(&*conn)
+        let keysets = metadata::load(
+            &*conn,
+            metadata::Scope::MintKeysets(&mint_url),
+            self.metadata_read_limits,
+        )
         .await?
         .into_iter()
         .map(sql_row_to_keyset)
         .collect::<Result<Vec<_>, Error>>()?;
-
         match keysets.is_empty() {
             false => Ok(Some(keysets)),
             true => Ok(None),
@@ -306,22 +331,13 @@ where
             .get()
             .await
             .map_err(|e| Error::Database(Box::new(e)))?;
-        query(
-            r#"
-            SELECT
-                id,
-                unit,
-                active,
-                input_fee_ppk,
-                final_expiry
-            FROM
-                keyset
-            WHERE id = :id
-            "#,
-        )?
-        .bind("id", keyset_id.to_string())
-        .fetch_one(&*conn)
+        metadata::load(
+            &*conn,
+            metadata::Scope::Keyset(keyset_id),
+            self.metadata_read_limits,
+        )
         .await?
+        .pop()
         .map(sql_row_to_keyset)
         .transpose()
     }
@@ -333,35 +349,7 @@ where
             .get()
             .await
             .map_err(|e| Error::Database(Box::new(e)))?;
-        query(
-            r#"
-            SELECT
-                id,
-                mint_url,
-                amount,
-                unit,
-                request,
-                state,
-                expiry,
-                secret_key,
-                payment_method,
-                amount_issued,
-                amount_paid,
-                updated_at,
-                estimated_blocks,
-                used_by_operation,
-                version
-            FROM
-                mint_quote
-            WHERE
-                id = :id
-            "#,
-        )?
-        .bind("id", quote_id.to_string())
-        .fetch_one(&*conn)
-        .await?
-        .map(sql_row_to_mint_quote)
-        .transpose()
+        mint_quotes::load(&*conn, quote_id, self.quote_read_limit).await
     }
 
     #[instrument(skip(self))]
@@ -371,33 +359,14 @@ where
             .get()
             .await
             .map_err(|e| Error::Database(Box::new(e)))?;
-        Ok(query(
-            r#"
-            SELECT
-                id,
-                mint_url,
-                amount,
-                unit,
-                request,
-                state,
-                expiry,
-                secret_key,
-                payment_method,
-                amount_issued,
-                amount_paid,
-                updated_at,
-                estimated_blocks,
-                used_by_operation,
-                version
-            FROM
-                mint_quote
-            "#,
-        )?
-        .fetch_all(&*conn)
-        .await?
-        .into_iter()
-        .map(sql_row_to_mint_quote)
-        .collect::<Result<_, _>>()?)
+        Ok(
+            query(&format!("SELECT {} FROM mint_quote", mint_quotes::COLUMNS))?
+                .fetch_all(&*conn)
+                .await?
+                .into_iter()
+                .map(sql_row_to_mint_quote)
+                .collect::<Result<_, _>>()?,
+        )
     }
 
     #[instrument(skip(self))]
@@ -407,37 +376,31 @@ where
             .get()
             .await
             .map_err(|e| Error::Database(Box::new(e)))?;
-        Ok(query(
-            r#"
-            SELECT
-                id,
-                mint_url,
-                amount,
-                unit,
-                request,
-                state,
-                expiry,
-                secret_key,
-                payment_method,
-                amount_issued,
-                amount_paid,
-                updated_at,
-                estimated_blocks,
-                used_by_operation,
-                version
-            FROM
-                mint_quote
-            WHERE
-                amount_issued = 0
-                OR
-                payment_method = 'bolt12'
-            "#,
-        )?
+        Ok(query(&format!(
+            "SELECT {} FROM mint_quote WHERE amount_issued = 0 OR payment_method = 'bolt12'",
+            mint_quotes::COLUMNS
+        ))?
         .fetch_all(&*conn)
         .await?
         .into_iter()
         .map(sql_row_to_mint_quote)
         .collect::<Result<_, _>>()?)
+    }
+
+    #[instrument(skip_all)]
+    async fn get_unissued_mint_quotes_page(
+        &self,
+        mint_url: MintUrl,
+        unit: CurrencyUnit,
+        after: Option<String>,
+        limit: u16,
+    ) -> Result<Vec<MintQuote>, database::Error> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| Error::Database(Box::new(e)))?;
+        mint_quotes::load_page(&*conn, mint_url, unit, after, limit).await
     }
 
     #[instrument(skip(self))]
@@ -450,34 +413,7 @@ where
             .get()
             .await
             .map_err(|e| Error::Database(Box::new(e)))?;
-        query(
-            r#"
-            SELECT
-                id,
-                unit,
-                amount,
-                request,
-                fee_reserve,
-                state,
-                expiry,
-                payment_proof,
-                payment_method,
-                estimated_blocks,
-                fee_index,
-                used_by_operation,
-                version,
-                mint_url
-            FROM
-                melt_quote
-            WHERE
-                id=:id
-            "#,
-        )?
-        .bind("id", quote_id.to_owned())
-        .fetch_one(&*conn)
-        .await?
-        .map(sql_row_to_melt_quote)
-        .transpose()
+        melt_quotes::load(&*conn, quote_id, self.quote_read_limit).await
     }
 
     #[instrument(skip(self), fields(keyset_id = %keyset_id))]
@@ -487,19 +423,15 @@ where
             .get()
             .await
             .map_err(|e| Error::Database(Box::new(e)))?;
-        query(
-            r#"
-            SELECT
-                keys
-            FROM key
-            WHERE id = :id
-            "#,
-        )?
-        .bind("id", keyset_id.to_string())
-        .pluck(&*conn)
+        metadata::load(
+            &*conn,
+            metadata::Scope::Keys(keyset_id),
+            self.metadata_read_limits,
+        )
         .await?
-        .map(|keys| {
-            let keys = column_as_string!(keys);
+        .pop()
+        .map(|mut row| {
+            let keys = column_as_string!(row.pop().ok_or(Error::InvalidDbResponse)?);
             serde_json::from_str(&keys).map_err(Error::from)
         })
         .transpose()
@@ -518,42 +450,60 @@ where
             .get()
             .await
             .map_err(|e| Error::Database(Box::new(e)))?;
-        Ok(query(
-            r#"
-            SELECT
-                amount,
-                unit,
-                keyset_id,
-                secret,
-                c,
-                witness,
-                dleq_e,
-                dleq_s,
-                dleq_r,
-                y,
-                mint_url,
-                state,
-                spending_condition,
-                used_by_operation,
-                created_by_operation,
-                derivation_index,
-                p2pk_e
-            FROM proof
-            "#,
-        )?
-        .fetch_all(&*conn)
-        .await?
-        .into_iter()
-        .filter_map(|row| {
-            let row = sql_row_to_proof_info(row).ok()?;
+        if let Some(max_bytes) = self.proof_read_limit {
+            return Ok(proofs::load_inventory(
+                &*conn,
+                proofs::InventoryScope::Filtered {
+                    mint_url,
+                    unit,
+                    states: state,
+                },
+                max_bytes / proofs::MIN_PROOF_BYTES,
+                max_bytes,
+            )
+            .await?
+            .into_iter()
+            .filter(|proof| proof.matches_conditions(&None, &None, &None, &spending_conditions))
+            .collect());
+        }
+        Ok(
+            query(&format!("SELECT {} FROM proof", proofs::COLUMNS.join(", ")))?
+                .fetch_all(&*conn)
+                .await?
+                .into_iter()
+                .filter_map(|row| {
+                    let row = sql_row_to_proof_info(row).ok()?;
 
-            if row.matches_conditions(&mint_url, &unit, &state, &spending_conditions) {
-                Some(row)
-            } else {
-                None
-            }
-        })
-        .collect::<Vec<_>>())
+                    if row.matches_conditions(&mint_url, &unit, &state, &spending_conditions) {
+                        Some(row)
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    #[instrument(skip_all)]
+    async fn get_unspent_proofs_bounded(
+        &self,
+        mint_url: MintUrl,
+        unit: CurrencyUnit,
+        max_proofs: u32,
+        max_bytes: u32,
+    ) -> Result<Vec<ProofInfo>, database::Error> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| Error::Database(Box::new(e)))?;
+        proofs::load_inventory(
+            &*conn,
+            proofs::InventoryScope::Unspent(mint_url, unit),
+            max_proofs,
+            max_bytes,
+        )
+        .await
     }
 
     #[instrument(skip(self, ys))]
@@ -566,36 +516,40 @@ where
             .get()
             .await
             .map_err(|e| Error::Database(Box::new(e)))?;
-        Ok(query(
-            r#"
-            SELECT
-                amount,
-                unit,
-                keyset_id,
-                secret,
-                c,
-                witness,
-                dleq_e,
-                dleq_s,
-                dleq_r,
-                y,
-                mint_url,
-                state,
-                spending_condition,
-                used_by_operation,
-                created_by_operation,
-                derivation_index,
-                p2pk_e
-            FROM proof
-            WHERE y IN (:ys)
-        "#,
-        )?
-        .bind_vec("ys", ys.iter().map(|y| y.to_bytes().to_vec()).collect())?
-        .fetch_all(&*conn)
-        .await?
-        .into_iter()
-        .filter_map(|row| sql_row_to_proof_info(row).ok())
-        .collect::<Vec<_>>())
+        if let Some(max_bytes) = self.proof_read_limit {
+            if ys.is_empty() {
+                return Ok(Vec::new());
+            }
+            // Every stored proof contributes two eight-byte scalar slots.
+            return proofs::load_inventory(
+                &*conn,
+                proofs::InventoryScope::Selected(ys),
+                max_bytes / 16,
+                max_bytes,
+            )
+            .await;
+        }
+        proofs::load(&*conn, ys).await
+    }
+
+    #[instrument(skip_all)]
+    async fn get_proofs_created_by_operation_page(
+        &self,
+        operation: Uuid,
+        after_y: Option<PublicKey>,
+        limit: u16,
+    ) -> Result<Vec<ProofInfo>, database::Error> {
+        if limit == 0 || limit > cdk_common::database::wallet::MAX_PROOF_PAGE_SIZE {
+            return Err(Error::Internal(
+                "Proof page size must be between 1 and 128".to_owned(),
+            ));
+        }
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| Error::Database(Box::new(e)))?;
+        proofs::load_created_by_operation_page(&*conn, operation, after_y, limit).await
     }
 
     async fn get_balance(
@@ -676,35 +630,7 @@ where
             .get()
             .await
             .map_err(|e| Error::Database(Box::new(e)))?;
-        Ok(query(
-            r#"
-            SELECT
-                mint_url,
-                direction,
-                unit,
-                amount,
-                fee,
-                ys,
-                timestamp,
-                memo,
-                metadata,
-                quote_id,
-                payment_request,
-                payment_proof,
-                payment_method,
-                saga_id,
-                status
-            FROM
-                transactions
-            WHERE
-                id = :id
-            "#,
-        )?
-        .bind("id", transaction_id.as_slice().to_vec())
-        .fetch_one(&*conn)
-        .await?
-        .map(sql_row_to_transaction)
-        .transpose()?)
+        transactions::load(&*conn, transaction_id, self.bounded_transaction_reads).await
     }
 
     #[instrument(skip(self))]
@@ -720,41 +646,35 @@ where
             .await
             .map_err(|e| Error::Database(Box::new(e)))?;
 
-        Ok(query(
-            r#"
-            SELECT
-                mint_url,
-                direction,
-                unit,
-                amount,
-                fee,
-                ys,
-                timestamp,
-                memo,
-                metadata,
-                quote_id,
-                payment_request,
-                payment_proof,
-                payment_method,
-                saga_id,
-                status
-            FROM
-                transactions
-            "#,
-        )?
+        Ok(query(&format!(
+            "SELECT {} FROM transactions",
+            transactions::COLUMNS.join(", ")
+        ))?
         .fetch_all(&*conn)
         .await?
         .into_iter()
-        .filter_map(|row| {
-            // TODO: Avoid a table scan by passing the heavy lifting of checking to the DB engine
-            let transaction = sql_row_to_transaction(row).ok()?;
-            if transaction.matches_conditions(&mint_url, &direction, &unit) {
-                Some(transaction)
-            } else {
-                None
-            }
-        })
+        .map(sql_row_to_transaction)
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .filter(|transaction| transaction.matches_conditions(&mint_url, &direction, &unit))
         .collect::<Vec<_>>())
+    }
+
+    #[instrument(skip_all)]
+    async fn get_transactions_page(
+        &self,
+        mint_url: Option<MintUrl>,
+        direction: Option<TransactionDirection>,
+        unit: Option<CurrencyUnit>,
+        after: Option<TransactionCursor>,
+        limit: u16,
+    ) -> Result<Vec<Transaction>, database::Error> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| Error::Database(Box::new(e)))?;
+        transactions::load_page(&*conn, mint_url, direction, unit, after, limit).await
     }
 
     async fn update_proofs(
@@ -769,80 +689,7 @@ where
             .map_err(|e| Error::Database(Box::new(e)))?;
         let tx = ConnectionWithTransaction::new(conn).await?;
 
-        for proof in added {
-            query(
-                r#"
-    INSERT INTO proof
-    (y, mint_url, state, spending_condition, unit, amount, keyset_id, secret, c, witness, dleq_e, dleq_s, dleq_r, used_by_operation, created_by_operation, derivation_index, p2pk_e)
-    VALUES
-    (:y, :mint_url, :state, :spending_condition, :unit, :amount, :keyset_id, :secret, :c, :witness, :dleq_e, :dleq_s, :dleq_r, :used_by_operation, :created_by_operation, :derivation_index, :p2pk_e)
-    ON CONFLICT(y) DO UPDATE SET
-        mint_url = excluded.mint_url,
-        state = excluded.state,
-        spending_condition = excluded.spending_condition,
-        unit = excluded.unit,
-        amount = excluded.amount,
-        keyset_id = excluded.keyset_id,
-        secret = excluded.secret,
-        c = excluded.c,
-        witness = excluded.witness,
-        dleq_e = excluded.dleq_e,
-        dleq_s = excluded.dleq_s,
-        dleq_r = excluded.dleq_r,
-        used_by_operation = excluded.used_by_operation,
-        created_by_operation = excluded.created_by_operation,
-        derivation_index = COALESCE(excluded.derivation_index, proof.derivation_index),
-        p2pk_e = excluded.p2pk_e
-    ;
-            "#,
-            )?
-            .bind("y", proof.y.to_bytes().to_vec())
-            .bind("mint_url", proof.mint_url.to_string())
-            .bind("state", proof.state.to_string())
-            .bind(
-                "spending_condition",
-                proof
-                    .spending_condition
-                    .map(|s| serde_json::to_string(&s).ok()),
-            )
-            .bind("unit", proof.unit.to_string())
-            .bind("amount", u64::from(proof.proof.amount) as i64)
-            .bind("keyset_id", proof.proof.keyset_id.to_string())
-            .bind("secret", proof.proof.secret.to_string())
-            .bind("c", proof.proof.c.to_bytes().to_vec())
-            .bind(
-                "witness",
-                proof
-                    .proof
-                    .witness
-                    .and_then(|w| serde_json::to_string(&w).ok()),
-            )
-            .bind(
-                "dleq_e",
-                proof.proof.dleq.as_ref().map(|dleq| dleq.e.to_secret_bytes().to_vec()),
-            )
-            .bind(
-                "dleq_s",
-                proof.proof.dleq.as_ref().map(|dleq| dleq.s.to_secret_bytes().to_vec()),
-            )
-            .bind(
-                "dleq_r",
-                proof.proof.dleq.as_ref().map(|dleq| dleq.r.to_secret_bytes().to_vec()),
-            )
-            .bind("used_by_operation", proof.used_by_operation.map(|id| id.to_string()))
-            .bind("created_by_operation", proof.created_by_operation.map(|id| id.to_string()))
-            .bind("derivation_index", proof.derivation_index.map(i64::from))
-            .bind(
-                "p2pk_e",
-                proof
-                    .proof
-                    .p2pk_e
-                    .as_ref()
-                    .map(|pk| pk.to_bytes().to_vec()),
-            )
-            .execute(&tx)
-            .await?;
-        }
+        proofs::store(&tx, added, true).await?;
 
         if !removed_ys.is_empty() {
             query(r#"DELETE FROM proof WHERE y IN (:ys)"#)?
@@ -857,6 +704,14 @@ where
         tx.commit().await?;
 
         Ok(())
+    }
+
+    async fn compare_and_swap_proofs(
+        &self,
+        changes: Vec<ProofChange>,
+        expected_saga: Option<&wallet::WalletSaga>,
+    ) -> Result<bool, database::Error> {
+        self.apply_proof_changes(changes, expected_saga).await
     }
 
     #[instrument(skip(self))]
@@ -897,66 +752,7 @@ where
             .await
             .map_err(|e| Error::Database(Box::new(e)))?;
 
-        let mint_url = transaction.mint_url.to_string();
-        let direction = transaction.direction.to_string();
-        let unit = transaction.unit.to_string();
-        let amount = u64::from(transaction.amount) as i64;
-        let fee = u64::from(transaction.fee) as i64;
-        let ys = transaction
-            .ys
-            .iter()
-            .flat_map(|y| y.to_bytes().to_vec())
-            .collect::<Vec<_>>();
-
-        let id = transaction.id();
-
-        query(
-               r#"
-   INSERT INTO transactions
-   (id, mint_url, direction, unit, amount, fee, ys, timestamp, memo, metadata, quote_id, payment_request, payment_proof, payment_method, saga_id, status)
-   VALUES
-   (:id, :mint_url, :direction, :unit, :amount, :fee, :ys, :timestamp, :memo, :metadata, :quote_id, :payment_request, :payment_proof, :payment_method, :saga_id, :status)
-   ON CONFLICT(id) DO UPDATE SET
-       mint_url = excluded.mint_url,
-       direction = excluded.direction,
-       unit = excluded.unit,
-       amount = excluded.amount,
-       fee = excluded.fee,
-       timestamp = excluded.timestamp,
-       memo = excluded.memo,
-       metadata = excluded.metadata,
-       quote_id = excluded.quote_id,
-       payment_request = excluded.payment_request,
-       payment_proof = excluded.payment_proof,
-       payment_method = excluded.payment_method,
-       saga_id = excluded.saga_id,
-       status = excluded.status
-   ;
-           "#,
-           )?
-           .bind("id", id.as_slice().to_vec())
-           .bind("mint_url", mint_url)
-           .bind("direction", direction)
-           .bind("unit", unit)
-           .bind("amount", amount)
-           .bind("fee", fee)
-           .bind("ys", ys)
-           .bind("timestamp", transaction.timestamp as i64)
-           .bind("memo", transaction.memo)
-           .bind(
-               "metadata",
-               serde_json::to_string(&transaction.metadata).map_err(Error::from)?,
-           )
-           .bind("quote_id", transaction.quote_id)
-           .bind("payment_request", transaction.payment_request)
-           .bind("payment_proof", transaction.payment_proof)
-           .bind("payment_method", transaction.payment_method.map(|pm| pm.to_string()))
-           .bind("saga_id", transaction.saga_id.map(|id| id.to_string()))
-           .bind("status", transaction.status.to_string())
-           .execute(&*conn)
-           .await?;
-
-        Ok(())
+        transactions::store(&*conn, transaction).await
     }
 
     #[instrument(skip(self))]
@@ -1003,6 +799,10 @@ where
             .get()
             .await
             .map_err(|e| Error::Database(Box::new(e)))?;
+
+        if count == 0 {
+            return keysets::counter(&*conn, *keyset_id).await;
+        }
 
         let new_counter = query(
             r#"
@@ -1197,26 +997,7 @@ where
         let tx = ConnectionWithTransaction::new(conn).await?;
 
         for keyset in keysets {
-            query(
-                r#"
-        INSERT INTO keyset
-        (mint_url, id, unit, active, input_fee_ppk, final_expiry, keyset_u32)
-        VALUES
-        (:mint_url, :id, :unit, :active, :input_fee_ppk, :final_expiry, :keyset_u32)
-        ON CONFLICT(id) DO UPDATE SET
-            active = excluded.active,
-            input_fee_ppk = excluded.input_fee_ppk
-        "#,
-            )?
-            .bind("mint_url", mint_url.to_string())
-            .bind("id", keyset.id.to_string())
-            .bind("unit", keyset.unit.to_string())
-            .bind("active", keyset.active)
-            .bind("input_fee_ppk", keyset.input_fee_ppk as i64)
-            .bind("final_expiry", keyset.final_expiry.map(|v| v as i64))
-            .bind("keyset_u32", u32::from(keyset.id))
-            .execute(&tx)
-            .await?;
+            keysets::store_info(&tx, &mint_url, keyset).await?;
         }
 
         tx.commit().await?;
@@ -1226,61 +1007,14 @@ where
 
     #[instrument(skip_all)]
     async fn add_mint_quote(&self, quote: MintQuote) -> Result<(), database::Error> {
+        mint_quotes::check_admission(&quote, self.quote_read_limit)?;
         let conn = self
             .pool
             .get()
             .await
             .map_err(|e| Error::Database(Box::new(e)))?;
 
-        let expected_version = quote.version;
-        let new_version = expected_version.wrapping_add(1);
-
-        let rows_affected = query(
-                r#"
-    INSERT INTO mint_quote
-    (id, mint_url, amount, unit, request, state, expiry, secret_key, payment_method, amount_issued, amount_paid, updated_at, estimated_blocks, version, used_by_operation)
-    VALUES
-    (:id, :mint_url, :amount, :unit, :request, :state, :expiry, :secret_key, :payment_method, :amount_issued, :amount_paid, :updated_at, :estimated_blocks, :version, :used_by_operation)
-    ON CONFLICT(id) DO UPDATE SET
-        mint_url = excluded.mint_url,
-        amount = excluded.amount,
-        unit = excluded.unit,
-        request = excluded.request,
-        state = excluded.state,
-        expiry = excluded.expiry,
-        secret_key = excluded.secret_key,
-        payment_method = excluded.payment_method,
-        amount_issued = excluded.amount_issued,
-        amount_paid = excluded.amount_paid,
-        updated_at = excluded.updated_at,
-        estimated_blocks = excluded.estimated_blocks,
-        version = :new_version,
-        used_by_operation = excluded.used_by_operation
-    WHERE mint_quote.version = :expected_version
-    ;
-            "#,
-            )?
-            .bind("id", quote.id.to_string())
-            .bind("mint_url", quote.mint_url.to_string())
-            .bind("amount", quote.amount.map(|a| a.to_i64()))
-            .bind("unit", quote.unit.to_string())
-            .bind("request", quote.request)
-            .bind("state", quote.state.to_string())
-            .bind("expiry", quote.expiry as i64)
-            .bind(
-                "secret_key",
-                quote.secret_key.map(|key| key.to_secret_hex()),
-            )
-            .bind("payment_method", quote.payment_method.to_string())
-            .bind("amount_issued", quote.amount_issued.to_i64())
-            .bind("amount_paid", quote.amount_paid.to_i64())
-            .bind("updated_at", quote.updated_at as i64)
-            .bind("estimated_blocks", quote.estimated_blocks.map(i64::from))
-            .bind("version", quote.version as i64)
-            .bind("new_version", new_version as i64)
-            .bind("expected_version", expected_version as i64)
-            .bind("used_by_operation", quote.used_by_operation)
-            .execute(&*conn).await?;
+        let rows_affected = mint_quotes::statement(quote)?.execute(&*conn).await?;
 
         if rows_affected == 0 {
             return Err(database::Error::ConcurrentUpdate);
@@ -1307,57 +1041,14 @@ where
 
     #[instrument(skip_all)]
     async fn add_melt_quote(&self, quote: wallet::MeltQuote) -> Result<(), database::Error> {
+        melt_quotes::check_admission(&quote, self.quote_read_limit)?;
         let conn = self
             .pool
             .get()
             .await
             .map_err(|e| Error::Database(Box::new(e)))?;
 
-        let expected_version = quote.version;
-        let new_version = expected_version.wrapping_add(1);
-
-        let rows_affected = query(
-            r#"
- INSERT INTO melt_quote
- (id, unit, amount, request, fee_reserve, state, expiry, payment_proof, payment_method, estimated_blocks, fee_index, version, mint_url, used_by_operation)
- VALUES
- (:id, :unit, :amount, :request, :fee_reserve, :state, :expiry, :payment_proof, :payment_method, :estimated_blocks, :fee_index, :version, :mint_url, :used_by_operation)
- ON CONFLICT(id) DO UPDATE SET
-     unit = excluded.unit,
-     amount = excluded.amount,
-     request = excluded.request,
-     fee_reserve = excluded.fee_reserve,
-     state = excluded.state,
-     expiry = excluded.expiry,
-     payment_proof = COALESCE(excluded.payment_proof, melt_quote.payment_proof),
-     payment_method = excluded.payment_method,
-     estimated_blocks = excluded.estimated_blocks,
-     fee_index = excluded.fee_index,
-     version = :new_version,
-     mint_url = excluded.mint_url,
-     used_by_operation = excluded.used_by_operation
- WHERE melt_quote.version = :expected_version
- ;
-         "#,
-        )?
-        .bind("id", quote.id.to_string())
-        .bind("unit", quote.unit.to_string())
-        .bind("amount", u64::from(quote.amount) as i64)
-        .bind("request", quote.request)
-        .bind("fee_reserve", u64::from(quote.fee_reserve) as i64)
-        .bind("state", quote.state.to_string())
-        .bind("expiry", quote.expiry as i64)
-        .bind("payment_proof", quote.payment_proof)
-        .bind("payment_method", quote.payment_method.to_string())
-        .bind("estimated_blocks", quote.estimated_blocks.map(i64::from))
-        .bind("fee_index", quote.fee_index.map(i64::from))
-        .bind("version", quote.version as i64)
-        .bind("new_version", new_version as i64)
-        .bind("expected_version", expected_version as i64)
-        .bind("mint_url", quote.mint_url.map(|m| m.to_string()))
-        .bind("used_by_operation", quote.used_by_operation)
-        .execute(&*conn)
-        .await?;
+        let rows_affected = melt_quotes::statement(quote)?.execute(&*conn).await?;
 
         if rows_affected == 0 {
             return Err(database::Error::ConcurrentUpdate);
@@ -1390,24 +1081,7 @@ where
             .await
             .map_err(|e| Error::Database(Box::new(e)))?;
 
-        keyset.verify_id()?;
-
-        query(
-            r#"
-                INSERT INTO key
-                (id, keys, keyset_u32)
-                VALUES
-                (:id, :keys, :keyset_u32)
-            "#,
-        )?
-        .bind("id", keyset.id.to_string())
-        .bind(
-            "keys",
-            serde_json::to_string(&keyset.keys).map_err(Error::from)?,
-        )
-        .bind("keyset_u32", u32::from(keyset.id))
-        .execute(&*conn)
-        .await?;
+        keysets::store_keys(&*conn, keyset).await?;
 
         Ok(())
     }
@@ -1426,6 +1100,32 @@ where
             .await?;
 
         Ok(())
+    }
+
+    #[tracing::instrument(skip_all)]
+    async fn token_transaction_retirable(
+        &self,
+        expected: &Transaction,
+    ) -> Result<bool, database::Error> {
+        self.token_history_retirable(expected).await
+    }
+
+    #[instrument(skip(self, expected))]
+    async fn retire_send_transactions(
+        &self,
+        expected: Vec<Transaction>,
+    ) -> Result<bool, database::Error> {
+        self.retire_token_history(expected, TransactionDirection::Outgoing, &[])
+            .await
+    }
+
+    #[instrument(skip(self, expected))]
+    async fn retire_incoming_transactions(
+        &self,
+        expected: Vec<Transaction>,
+    ) -> Result<bool, database::Error> {
+        self.retire_token_history(expected, TransactionDirection::Incoming, &[])
+            .await
     }
 
     #[instrument(skip(self))]
@@ -1449,49 +1149,24 @@ where
 
     #[instrument(skip(self))]
     async fn add_saga(&self, saga: wallet::WalletSaga) -> Result<(), database::Error> {
+        self.check_saga_read_limit(&saga)?;
         let conn = self
             .pool
             .get()
             .await
             .map_err(|e| Error::Database(Box::new(e)))?;
 
-        let state_json = serde_json::to_string(&saga.state).map_err(|e| {
-            Error::Database(Box::new(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("Failed to serialize saga state: {}", e),
-            )))
-        })?;
-
-        let data_json = serde_json::to_string(&saga.data).map_err(|e| {
-            Error::Database(Box::new(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("Failed to serialize saga data: {}", e),
-            )))
-        })?;
-
-        query(
-            r#"
-            INSERT INTO wallet_sagas
-            (id, kind, state, amount, mint_url, unit, quote_id, created_at, updated_at, data, version)
-            VALUES
-            (:id, :kind, :state, :amount, :mint_url, :unit, :quote_id, :created_at, :updated_at, :data, :version)
-            "#,
-        )?
-        .bind("id", saga.id.to_string())
-        .bind("kind", saga.kind.to_string())
-        .bind("state", state_json)
-        .bind("amount", u64::from(saga.amount) as i64)
-        .bind("mint_url", saga.mint_url.to_string())
-        .bind("unit", saga.unit.to_string())
-        .bind("quote_id", saga.quote_id)
-        .bind("created_at", saga.created_at as i64)
-        .bind("updated_at", saga.updated_at as i64)
-        .bind("data", data_json)
-        .bind("version", saga.version as i64)
-        .execute(&*conn)
-        .await?;
-
-        Ok(())
+        if RM::Connection::name() != "sqlite" {
+            return sagas::insert(&*conn, &saga).await;
+        }
+        let tx = ConnectionWithTransaction::new(conn).await?;
+        match storage_capacity::insert_saga(&tx, &saga).await {
+            Ok(()) => tx.commit().await,
+            Err(error) => {
+                tx.rollback().await?;
+                Err(error)
+            }
+        }
     }
 
     #[instrument(skip(self))]
@@ -1504,76 +1179,63 @@ where
             .get()
             .await
             .map_err(|e| Error::Database(Box::new(e)))?;
-
-        let rows = query(
-            r#"
-            SELECT id, kind, state, amount, mint_url, unit, quote_id, created_at, updated_at, data, version
-            FROM wallet_sagas
-            WHERE id = :id
-            "#,
-        )?
-        .bind("id", id.to_string())
-        .fetch_all(&*conn)
-        .await?;
-
-        match rows.into_iter().next() {
-            Some(row) => Ok(Some(sql_row_to_wallet_saga(row)?)),
-            None => Ok(None),
-        }
+        sagas::load_locked(&*conn, id, self.saga_read_limit, false).await
     }
 
     #[instrument(skip(self))]
     async fn update_saga(&self, saga: wallet::WalletSaga) -> Result<bool, database::Error> {
+        self.check_saga_read_limit(&saga)?;
         let conn = self
             .pool
             .get()
             .await
             .map_err(|e| Error::Database(Box::new(e)))?;
 
-        let state_json = serde_json::to_string(&saga.state).map_err(|e| {
-            Error::Database(Box::new(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("Failed to serialize saga state: {}", e),
-            )))
-        })?;
+        let tx = ConnectionWithTransaction::new(conn).await?;
+        let outcome = sagas::update(
+            &tx,
+            &saga,
+            self.saga_read_limit,
+            self.bounded_transaction_reads,
+            RM::Connection::name() == "sqlite",
+        )
+        .await;
+        match outcome {
+            Ok(true) => {
+                tx.commit().await?;
+                Ok(true)
+            }
+            other => {
+                tx.rollback().await?;
+                other
+            }
+        }
+    }
 
-        let data_json = serde_json::to_string(&saga.data).map_err(|e| {
-            Error::Database(Box::new(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("Failed to serialize saga data: {}", e),
-            )))
-        })?;
+    fn supports_atomic_melt_completion(&self) -> bool {
+        true
+    }
 
-        // Optimistic locking: only update if the version matches the expected value.
-        // The saga.version has already been incremented by the caller, so we check
-        // for (saga.version - 1) in the WHERE clause.
-        let expected_version = saga.version.saturating_sub(1);
+    async fn complete_melt(
+        &self,
+        expected: &wallet::WalletSaga,
+        next: wallet::WalletSaga,
+        quote: &wallet::MeltQuote,
+    ) -> Result<bool, database::Error> {
+        self.complete_melt_transaction(expected, next, quote).await
+    }
 
-        let rows_affected = query(
-            r#"
-            UPDATE wallet_sagas
-            SET kind = :kind, state = :state, amount = :amount, mint_url = :mint_url,
-                unit = :unit, quote_id = :quote_id, updated_at = :updated_at, data = :data,
-                version = :new_version
-            WHERE id = :id AND version = :expected_version
-            "#,
-        )?
-        .bind("id", saga.id.to_string())
-        .bind("kind", saga.kind.to_string())
-        .bind("state", state_json)
-        .bind("amount", u64::from(saga.amount) as i64)
-        .bind("mint_url", saga.mint_url.to_string())
-        .bind("unit", saga.unit.to_string())
-        .bind("quote_id", saga.quote_id)
-        .bind("updated_at", saga.updated_at as i64)
-        .bind("data", data_json)
-        .bind("new_version", saga.version as i64)
-        .bind("expected_version", expected_version as i64)
-        .execute(&*conn)
-        .await?;
+    fn supports_atomic_saga_completion(&self) -> bool {
+        true
+    }
 
-        // Return true if the update succeeded (version matched), false if version mismatch
-        Ok(rows_affected > 0)
+    async fn complete_saga(
+        &self,
+        expected: &wallet::WalletSaga,
+        next: wallet::WalletSaga,
+        receipt: Transaction,
+    ) -> Result<bool, database::Error> {
+        self.commit_saga_receipt(expected, next, receipt).await
     }
 
     #[instrument(skip(self))]
@@ -1584,12 +1246,30 @@ where
             .await
             .map_err(|e| Error::Database(Box::new(e)))?;
 
-        query(r#"DELETE FROM wallet_sagas WHERE id = :id"#)?
-            .bind("id", id.to_string())
-            .execute(&*conn)
-            .await?;
+        if RM::Connection::name() != "sqlite" {
+            return sagas::delete(&*conn, id).await;
+        }
+        let tx = ConnectionWithTransaction::new(conn).await?;
+        match storage_capacity::delete_saga(&tx, id).await {
+            Ok(()) => tx.commit().await,
+            Err(error) => {
+                tx.rollback().await?;
+                Err(error)
+            }
+        }
+    }
 
-        Ok(())
+    async fn get_incomplete_saga_ids(
+        &self,
+        after: Option<cdk_common::database::wallet::SagaCursor>,
+        limit: u16,
+    ) -> Result<Vec<cdk_common::database::wallet::SagaCursor>, database::Error> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| Error::Database(Box::new(e)))?;
+        sagas::identities(&*conn, after, limit).await
     }
 
     #[instrument(skip(self))]
@@ -1689,36 +1369,61 @@ where
             .get()
             .await
             .map_err(|e| Error::Database(Box::new(e)))?;
-
-        let rows = query(
-            r#"
-            SELECT
-                amount,
-                unit,
-                keyset_id,
-                secret,
-                c,
-                witness,
-                dleq_e,
-                dleq_s,
-                dleq_r,
-                y,
-                mint_url,
-                state,
-                spending_condition,
-                used_by_operation,
-                created_by_operation,
-                derivation_index,
-                p2pk_e
-            FROM proof
-            WHERE used_by_operation = :operation_id
-            "#,
-        )?
+        if let Some(max_bytes) = self.proof_read_limit {
+            // The predicate guarantees a 36-byte owner UUID, in addition to
+            // the two scalar slots. One extra row proves the byte budget cannot fit.
+            return proofs::load_inventory(
+                &*conn,
+                proofs::InventoryScope::Reserved(*operation_id),
+                max_bytes / (16 + 36),
+                max_bytes,
+            )
+            .await;
+        }
+        let rows = query(&format!(
+            "SELECT {} FROM proof WHERE used_by_operation = :operation_id",
+            proofs::COLUMNS.join(", ")
+        ))?
         .bind("operation_id", operation_id.to_string())
         .fetch_all(&*conn)
         .await?;
 
         rows.into_iter().map(sql_row_to_proof_info).collect()
+    }
+
+    #[instrument(skip_all)]
+    async fn acquire_melt(
+        &self,
+        saga: &wallet::WalletSaga,
+        quote: &wallet::MeltQuote,
+    ) -> Result<bool, database::Error> {
+        self.acquire_melt_transaction(saga, quote).await
+    }
+
+    fn supports_atomic_issue_retirement(&self) -> bool {
+        true
+    }
+
+    async fn retire_issue(
+        &self,
+        expected: &wallet::WalletSaga,
+        quotes: &[MintQuote],
+        proofs: Option<Vec<cdk_common::database::wallet::ProofChange>>,
+    ) -> Result<bool, database::Error> {
+        self.retire_issue_transaction(expected, quotes, proofs)
+            .await
+    }
+
+    async fn acquire_issue(
+        &self,
+        saga: &wallet::WalletSaga,
+        quotes: &[MintQuote],
+        keyset: KeySet,
+        counter_start: u32,
+        counter_count: u32,
+    ) -> Result<bool, database::Error> {
+        self.acquire_issue_transaction(saga, quotes, keyset, counter_start, counter_count)
+            .await
     }
 
     #[instrument(skip(self))]
@@ -1860,6 +1565,17 @@ where
         key: &str,
     ) -> Result<Option<Vec<u8>>, database::Error> {
         crate::keyvalue::kv_read(&self.pool, primary_namespace, secondary_namespace, key).await
+    }
+
+    async fn kv_read_bounded(
+        &self,
+        primary_namespace: &str,
+        secondary_namespace: &str,
+        key: &str,
+        max_bytes: u32,
+    ) -> Result<Option<Vec<u8>>, database::Error> {
+        self.read_bounded_value(primary_namespace, secondary_namespace, key, max_bytes)
+            .await
     }
 
     async fn kv_list(
@@ -2100,7 +1816,10 @@ fn sql_row_to_mint_quote(row: Vec<Column>) -> Result<MintQuote, Error> {
         request: column_as_string!(request),
         state: column_as_string!(state, MintQuoteState::from_str),
         expiry: expiry_val,
-        secret_key: column_as_nullable_string!(secret_key, |s| SecretKey::from_str(&s).ok()),
+        secret_key: column_as_nullable_string!(secret_key)
+            .map(|key| SecretKey::from_str(&key))
+            .transpose()
+            .map_err(|error| Error::Database(Box::new(error)))?,
         payment_method,
         amount_issued: Amount::from(amount_minted),
         amount_paid: Amount::from(amount_paid),
@@ -2141,7 +1860,10 @@ fn sql_row_to_melt_quote(row: Vec<Column>) -> Result<wallet::MeltQuote, Error> {
 
     Ok(wallet::MeltQuote {
         id: column_as_string!(id),
-        mint_url: column_as_nullable_string!(mint_url, |s| MintUrl::from_str(&s).ok()),
+        mint_url: column_as_nullable_string!(mint_url)
+            .map(|url| MintUrl::from_str(&url))
+            .transpose()
+            .map_err(|error| Error::Database(Box::new(error)))?,
         unit: column_as_string!(unit, CurrencyUnit::from_str),
         amount: Amount::from(amount_val),
         request: column_as_string!(request),
@@ -2192,7 +1914,8 @@ fn sql_row_to_proof_info(row: Vec<Column>) -> Result<ProofInfo, Error> {
 
             Some(ProofDleq::new(e_key, s_key, r_key))
         }
-        _ => None,
+        (None, None, None) => None,
+        _ => return Err(Error::Internal("incomplete proof DLEQ".to_owned())),
     };
 
     let amount: u64 = column_as_number!(amount);
@@ -2200,9 +1923,7 @@ fn sql_row_to_proof_info(row: Vec<Column>) -> Result<ProofInfo, Error> {
         amount: Amount::from(amount),
         keyset_id: column_as_string!(keyset_id, Id::from_str),
         secret: column_as_string!(secret, Secret::from_str),
-        witness: column_as_nullable_string!(witness, |v| { serde_json::from_str(&v).ok() }, |v| {
-            serde_json::from_slice(&v).ok()
-        }),
+        witness: proofs::optional_json(witness)?,
         c: column_as_string!(c, PublicKey::from_str, PublicKey::from_slice),
         dleq,
         p2pk_e: column_as_nullable_binary!(p2pk_e)
@@ -2210,10 +1931,8 @@ fn sql_row_to_proof_info(row: Vec<Column>) -> Result<ProofInfo, Error> {
             .transpose()?,
     };
 
-    let used_by_operation =
-        column_as_nullable_string!(used_by_operation).and_then(|id| Uuid::from_str(&id).ok());
-    let created_by_operation =
-        column_as_nullable_string!(created_by_operation).and_then(|id| Uuid::from_str(&id).ok());
+    let used_by_operation = proofs::optional_uuid(used_by_operation)?;
+    let created_by_operation = proofs::optional_uuid(created_by_operation)?;
     let derivation_index = column_as_nullable_number!(derivation_index);
 
     Ok(ProofInfo {
@@ -2221,11 +1940,7 @@ fn sql_row_to_proof_info(row: Vec<Column>) -> Result<ProofInfo, Error> {
         y: column_as_string!(y, PublicKey::from_str, PublicKey::from_slice),
         mint_url: column_as_string!(mint_url, MintUrl::from_str),
         state: column_as_string!(state, State::from_str),
-        spending_condition: column_as_nullable_string!(
-            spending_condition,
-            |r| { serde_json::from_str(&r).ok() },
-            |r| { serde_json::from_slice(&r).ok() }
-        ),
+        spending_condition: proofs::optional_json(spending_condition)?,
         unit: column_as_string!(unit, CurrencyUnit::from_str),
         used_by_operation,
         created_by_operation,
@@ -2319,7 +2034,9 @@ fn sql_row_to_transaction(row: Vec<Column>) -> Result<Transaction, Error> {
             payment_proof,
             payment_method,
             saga_id,
-            status
+            status,
+            role,
+            id
         ) = row
     );
 
@@ -2327,10 +2044,12 @@ fn sql_row_to_transaction(row: Vec<Column>) -> Result<Transaction, Error> {
     let fee: u64 = column_as_number!(fee);
 
     let saga_id: Option<Uuid> = column_as_nullable_string!(saga_id)
-        .map(|id| Uuid::from_str(&id).ok())
-        .flatten();
+        .map(|id| Uuid::from_str(&id))
+        .transpose()
+        .map_err(|_| Error::Internal("Invalid transaction saga UUID".to_owned()))?;
 
-    Ok(Transaction {
+    let transaction = Transaction {
+        role: column_as_string!(role, TransactionRole::from_str),
         mint_url: column_as_string!(mint_url, MintUrl::from_str),
         direction: column_as_string!(direction, TransactionDirection::from_str),
         unit: column_as_string!(unit, CurrencyUnit::from_str),
@@ -2342,10 +2061,7 @@ fn sql_row_to_transaction(row: Vec<Column>) -> Result<Transaction, Error> {
             .collect::<Result<Vec<_>, _>>()?,
         timestamp: column_as_number!(timestamp),
         memo: column_as_nullable_string!(memo),
-        metadata: column_as_nullable_string!(metadata, |v| serde_json::from_str(&v).ok(), |v| {
-            serde_json::from_slice(&v).ok()
-        })
-        .unwrap_or_default(),
+        metadata: proofs::optional_json(metadata)?.unwrap_or_default(),
         quote_id: column_as_nullable_string!(quote_id),
         payment_request: column_as_nullable_string!(payment_request),
         payment_proof: column_as_nullable_string!(payment_proof),
@@ -2355,7 +2071,18 @@ fn sql_row_to_transaction(row: Vec<Column>) -> Result<Transaction, Error> {
             .map_err(Error::from)?,
         saga_id,
         status: column_as_string!(status, TransactionStatus::from_str),
-    })
+    };
+    transaction
+        .validate_role()
+        .map_err(|e| Error::Internal(e.to_string()))?;
+    if transaction.role == TransactionRole::SendRefund
+        && column_as_binary!(id) != transaction.id().as_slice()
+    {
+        return Err(Error::Internal(
+            "Invalid send refund transaction ID".to_owned(),
+        ));
+    }
+    Ok(transaction)
 }
 
 fn sql_row_to_p2pk_signing_key(row: Vec<Column>) -> Result<wallet::P2PKSigningKey, Error> {

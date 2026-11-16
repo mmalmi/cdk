@@ -4,7 +4,40 @@ use cdk_sql_common::SQLWalletDatabase;
 
 use crate::common::SqliteConnectionManager;
 
+#[cfg(test)]
+mod issue_acquisition;
+#[cfg(test)]
+mod issue_retirement;
+#[cfg(test)]
+mod kv_batch;
+#[cfg(test)]
+mod kv_bounds;
+#[cfg(test)]
+mod melt_acquisition;
+#[cfg(test)]
+mod melt_completion;
 pub mod memory;
+#[cfg(test)]
+mod metadata_reads;
+#[cfg(test)]
+mod saga_completion;
+
+#[cfg(test)]
+mod mint_quote_pages;
+#[cfg(test)]
+mod proof_changes;
+#[cfg(test)]
+mod proof_pages;
+#[cfg(test)]
+mod quote_comparison;
+#[cfg(test)]
+mod saga_pages;
+#[cfg(test)]
+mod storage_capacity;
+#[cfg(test)]
+mod test_db;
+#[cfg(test)]
+mod transaction_pages;
 
 /// Mint SQLite implementation with rusqlite
 pub type WalletSqliteDatabase = SQLWalletDatabase<SqliteConnectionManager>;
@@ -20,6 +53,26 @@ mod tests {
     }
 
     wallet_db_test!(provide_db);
+    wallet_db_test!(provide_db, incomplete_saga_pages);
+    wallet_db_test!(provide_db, kv_read_bounded_contract);
+    wallet_db_test!(
+        provide_db,
+        issue_retirement_contract,
+        issue_retirement_concurrent,
+        issue_retirement_invalid
+    );
+    wallet_db_test!(
+        provide_db,
+        issue_acquisition_contract,
+        issue_acquisition_invalid,
+        issue_acquisition_concurrent
+    );
+    wallet_db_test!(
+        provide_db,
+        proofs_created_by_operation_pages,
+        proofs_created_by_operation_page_limits,
+        proofs_created_by_operation_cursor_survives_deletion,
+    );
     use std::str::FromStr;
 
     use cdk_common::database::WalletDatabase;

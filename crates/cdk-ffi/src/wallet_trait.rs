@@ -190,6 +190,20 @@ impl WalletTraitDef for Wallet {
         Ok(proofs)
     }
 
+    async fn retire_send_transactions(
+        &self,
+        expected: Vec<cdk_common::wallet::Transaction>,
+    ) -> Result<bool, Self::Error> {
+        Ok(WalletTraitDef::retire_send_transactions(self.inner().as_ref(), expected).await?)
+    }
+
+    async fn retire_incoming_transactions(
+        &self,
+        expected: Vec<cdk_common::wallet::Transaction>,
+    ) -> Result<bool, Self::Error> {
+        Ok(WalletTraitDef::retire_incoming_transactions(self.inner().as_ref(), expected).await?)
+    }
+
     async fn revert_transaction(
         &self,
         id: cdk_common::wallet::TransactionId,
@@ -206,6 +220,13 @@ impl WalletTraitDef for Wallet {
     async fn recover_incomplete_sagas(&self) -> Result<Self::RecoveryReport, Self::Error> {
         let report = WalletTraitDef::recover_incomplete_sagas(self.inner().as_ref()).await?;
         Ok(report.into())
+    }
+
+    async fn check_proofs_state(
+        &self,
+        proofs: cdk_common::Proofs,
+    ) -> Result<Vec<cdk_common::nuts::nut07::ProofState>, Self::Error> {
+        Ok(WalletTraitDef::check_proofs_state(self.inner().as_ref(), proofs).await?)
     }
 
     async fn check_proofs_spent(
@@ -268,6 +289,44 @@ impl WalletTraitDef for Wallet {
     async fn get_pending_sends(&self) -> Result<Vec<String>, Self::Error> {
         let ids = WalletTraitDef::get_pending_sends(self.inner().as_ref()).await?;
         Ok(ids.into_iter().map(|id| id.to_string()).collect())
+    }
+
+    async fn recover_send_confirmation(&self, operation_id: String) -> Result<(), Self::Error> {
+        let uuid = uuid::Uuid::parse_str(&operation_id)
+            .map_err(|e| FfiError::internal(format!("Invalid operation ID: {}", e)))?;
+        WalletTraitDef::recover_send_confirmation(self.inner().as_ref(), uuid).await?;
+        Ok(())
+    }
+
+    async fn cancel_prepared_send(
+        &self,
+        operation_id: String,
+        amount: Self::Amount,
+        inputs: cdk_common::nuts::Proofs,
+    ) -> Result<(), Self::Error> {
+        let uuid = uuid::Uuid::parse_str(&operation_id)
+            .map_err(|e| FfiError::internal(format!("Invalid operation ID: {}", e)))?;
+        WalletTraitDef::cancel_prepared_send(self.inner().as_ref(), uuid, amount.into(), inputs)
+            .await?;
+        Ok(())
+    }
+
+    async fn acknowledge_prepared_cancellation(
+        &self,
+        operation_id: String,
+        amount: Self::Amount,
+        inputs: cdk_common::nuts::Proofs,
+    ) -> Result<(), Self::Error> {
+        let uuid = uuid::Uuid::parse_str(&operation_id)
+            .map_err(|e| FfiError::internal(format!("Invalid operation ID: {}", e)))?;
+        WalletTraitDef::acknowledge_prepared_cancellation(
+            self.inner().as_ref(),
+            uuid,
+            amount.into(),
+            inputs,
+        )
+        .await?;
+        Ok(())
     }
 
     async fn revoke_send(&self, operation_id: String) -> Result<Self::Amount, Self::Error> {

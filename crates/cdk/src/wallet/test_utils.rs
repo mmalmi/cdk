@@ -5,6 +5,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::io::{self, Write};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use bip39::Mnemonic;
@@ -497,14 +498,20 @@ pub async fn create_test_wallet_with_mock_http_subscription(
 /// Mock MintConnector for testing recovery scenarios
 #[derive(Debug)]
 pub struct MockMintConnector {
+    /// Metadata endpoint calls, including failed key lookups.
+    pub metadata_requests: AtomicUsize,
     /// Mock mint keyset state
     pub keysets: Mutex<Vec<KeySet>>,
     /// Mock mint info state
     pub mint_info: Mutex<MintInfo>,
     /// Response for post_check_state calls
     pub check_state_response: Mutex<Option<Result<CheckStateResponse, Error>>>,
+    /// Receive fixtures can explicitly assume unstaged incoming coins are unspent.
+    pub unspent_check_fallback: bool,
     /// Response for post_restore calls
     pub restore_response: Mutex<Option<Result<RestoreResponse, Error>>>,
+    /// Optional pause after a restore request starts, for deterministic recovery races.
+    pub restore_gate: Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
     /// Response for get_melt_quote_status calls
     pub melt_quote_status_response: Mutex<Option<Result<MeltQuoteBolt11Response<String>, Error>>>,
     /// Queue of responses for successive get_melt_quote_status calls.
@@ -515,8 +522,12 @@ pub struct MockMintConnector {
     /// followed by an authoritative HTTP recheck).
     pub melt_quote_status_responses:
         Mutex<std::collections::VecDeque<Result<MeltQuoteBolt11Response<String>, Error>>>,
+    /// Pause after capturing a status response, before delivering it to the caller.
+    pub melt_quote_status_gate: Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
     /// Response for post_mint calls
     pub post_mint_response: Mutex<Option<Result<MintResponse, Error>>>,
+    /// Pause one single or batch mint request before returning its response.
+    pub mint_gate: Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
     /// Queue of responses for successive post_mint_quote calls.
     pub post_mint_quote_responses:
         Mutex<std::collections::VecDeque<Result<MintQuoteResponse<String>, Error>>>,
@@ -575,18 +586,31 @@ impl Default for MockMintConnector {
 }
 
 impl MockMintConnector {
+    async fn pause_mint(&self) {
+        let gate = self.mint_gate.lock().unwrap().take();
+        if let Some((entered, proceed)) = gate {
+            entered.notify_one();
+            proceed.notified().await;
+        }
+    }
+
     pub fn new() -> Self {
         let keyset = test_keyset();
         let mint_info = test_mint_info();
 
         Self {
+            metadata_requests: AtomicUsize::new(0),
             keysets: Mutex::new(vec![keyset]),
             mint_info: Mutex::new(mint_info),
             check_state_response: Mutex::new(None),
+            unspent_check_fallback: false,
             restore_response: Mutex::new(None),
+            restore_gate: Mutex::new(None),
             melt_quote_status_response: Mutex::new(None),
             melt_quote_status_responses: Mutex::new(std::collections::VecDeque::new()),
+            melt_quote_status_gate: Mutex::new(None),
             post_mint_response: Mutex::new(None),
+            mint_gate: Mutex::new(None),
             post_mint_quote_responses: Mutex::new(std::collections::VecDeque::new()),
             post_mint_quote_requests: Mutex::new(Vec::new()),
             post_mint_responses: Mutex::new(std::collections::VecDeque::new()),
@@ -906,10 +930,12 @@ impl MintConnector for MockMintConnector {
     }
 
     async fn get_mint_keys(&self) -> Result<Vec<crate::nuts::KeySet>, Error> {
+        self.metadata_requests.fetch_add(1, Ordering::SeqCst);
         Ok(self.keysets.lock().unwrap().clone())
     }
 
     async fn get_mint_keyset(&self, keyset_id: Id) -> Result<crate::nuts::KeySet, Error> {
+        self.metadata_requests.fetch_add(1, Ordering::SeqCst);
         self.keysets
             .lock()
             .unwrap()
@@ -920,6 +946,7 @@ impl MintConnector for MockMintConnector {
     }
 
     async fn get_mint_keysets(&self) -> Result<KeysetResponse, Error> {
+        self.metadata_requests.fetch_add(1, Ordering::SeqCst);
         let keysets = self.keysets.lock().unwrap();
 
         Ok(KeysetResponse {
@@ -971,6 +998,7 @@ impl MintConnector for MockMintConnector {
             .unwrap()
             .push((method.clone(), request.clone()));
 
+        self.pause_mint().await;
         let queued = self.post_mint_responses.lock().unwrap().pop_front();
         match queued {
             Some(response) => response,
@@ -1017,8 +1045,13 @@ impl MintConnector for MockMintConnector {
                 .expect(
                     "MockMintConnector: get_melt_quote_status called without configured response",
                 ),
-        }?;
-        Ok(MeltQuoteResponse::Bolt11(response))
+        };
+        let gate = self.melt_quote_status_gate.lock().unwrap().take();
+        if let Some((entered, proceed)) = gate {
+            entered.notify_one();
+            proceed.notified().await;
+        }
+        response.map(MeltQuoteResponse::Bolt11)
     }
 
     async fn post_swap(&self, request: SwapRequest) -> Result<SwapResponse, Error> {
@@ -1036,21 +1069,38 @@ impl MintConnector for MockMintConnector {
     }
 
     async fn get_mint_info(&self) -> Result<crate::nuts::MintInfo, Error> {
+        self.metadata_requests.fetch_add(1, Ordering::SeqCst);
         Ok(self.mint_info.lock().unwrap().clone())
     }
 
     async fn post_check_state(
         &self,
-        _request: CheckStateRequest,
+        request: CheckStateRequest,
     ) -> Result<CheckStateResponse, Error> {
         self.check_state_response
             .lock()
             .unwrap()
             .take()
+            .or_else(|| {
+                self.unspent_check_fallback.then(|| {
+                    Ok(CheckStateResponse {
+                        states: request
+                            .ys
+                            .into_iter()
+                            .map(|y| (y, State::Unspent).into())
+                            .collect(),
+                    })
+                })
+            })
             .expect("MockMintConnector: post_check_state called without configured response")
     }
 
     async fn post_restore(&self, _request: RestoreRequest) -> Result<RestoreResponse, Error> {
+        let gate = self.restore_gate.lock().unwrap().take();
+        if let Some((entered, proceed)) = gate {
+            entered.notify_one();
+            proceed.notified().await;
+        }
         self.restore_response
             .lock()
             .unwrap()
@@ -1101,6 +1151,7 @@ impl MintConnector for MockMintConnector {
             .unwrap()
             .push((method.clone(), request.clone()));
 
+        self.pause_mint().await;
         let queued = self.post_batch_mint_responses.lock().unwrap().pop_front();
         match queued {
             Some(response) => response,
@@ -1114,4 +1165,30 @@ impl MintConnector for MockMintConnector {
             }
         }
     }
+}
+
+/// Original unsigned issue request for recovery fixtures.
+pub fn test_issue_data(
+    quote: cdk_common::wallet::MintQuote,
+    premint_secrets: crate::nuts::PreMintSecrets,
+) -> cdk_common::wallet::MintOperationData {
+    use cdk_common::wallet::{MintCheckpoint, MintOperationData, MintRequestData};
+    let quote_id = quote.id.clone();
+    let amount = Amount::try_sum(premint_secrets.secrets.iter().map(|p| p.amount)).unwrap();
+    let mut data = MintOperationData::new_single(quote_id.clone(), amount);
+    data.checkpoint = Some(Box::new(MintCheckpoint {
+        quotes: vec![quote],
+        payment_method: PaymentMethod::BOLT11,
+        request: MintRequestData::Single {
+            request: crate::nuts::MintRequest {
+                quote: quote_id,
+                outputs: premint_secrets.blinded_messages(),
+                signature: None,
+            },
+            legacy_signature: None,
+            allow_unsigned: false,
+        },
+        premint_secrets,
+    }));
+    data
 }

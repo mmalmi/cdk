@@ -13,7 +13,7 @@ use crate::nuts::CurrencyUnit;
 use crate::wallet::auth::{AuthMintConnector, AuthWallet};
 use crate::wallet::mint_connector::transport::{Async, RateLimitedTransport};
 use crate::wallet::mint_connector::{RateLimitedAuthHttpClient, RateLimitedHttpClient};
-use crate::wallet::mint_metadata_cache::MintMetadataCache;
+use crate::wallet::mint_metadata_cache::{MintMetadataCache, MintMetadataLimits};
 use crate::wallet::{
     AuthHttpClient, HttpClient, MintConnector, RateLimitConfig, RateLimiterManager,
     SubscriptionManager, Wallet,
@@ -35,6 +35,9 @@ pub struct WalletBuilder {
     unit: Option<CurrencyUnit>,
     localstore: Option<Arc<dyn WalletDatabase<database::Error> + Send + Sync>>,
     target_proof_count: Option<usize>,
+    max_outputs: Option<u32>,
+    proof_inventory_limits: Option<(u32, u32)>,
+    mint_metadata_limits: Option<MintMetadataLimits>,
     auth_wallet: Option<AuthWallet>,
     auth_connector: Option<Arc<dyn AuthMintConnector + Send + Sync>>,
     seed: Option<[u8; 64]>,
@@ -54,6 +57,9 @@ impl std::fmt::Debug for WalletBuilder {
             .field("mint_url", &self.mint_url)
             .field("unit", &self.unit)
             .field("target_proof_count", &self.target_proof_count)
+            .field("max_outputs", &self.max_outputs)
+            .field("proof_inventory_limits", &self.proof_inventory_limits)
+            .field("mint_metadata_limits", &self.mint_metadata_limits)
             .finish_non_exhaustive()
     }
 }
@@ -65,6 +71,9 @@ impl Default for WalletBuilder {
             unit: None,
             localstore: None,
             target_proof_count: Some(3),
+            max_outputs: None,
+            proof_inventory_limits: None,
+            mint_metadata_limits: None,
             auth_wallet: None,
             auth_connector: None,
             seed: None,
@@ -142,6 +151,36 @@ impl WalletBuilder {
     /// Set the target proof count
     pub fn target_proof_count(mut self, count: usize) -> Self {
         self.target_proof_count = Some(count);
+        self
+    }
+
+    /// Limit newly created outputs in each swap or mint request, including change.
+    ///
+    /// The default is no configured limit. Zero permits direct sends but no new
+    /// outputs. This admission limit does not invalidate already submitted requests.
+    pub fn with_max_outputs(mut self, maximum: u32) -> Self {
+        self.max_outputs = Some(maximum);
+        self
+    }
+
+    /// Limit unspent inventory reads used by new send, melt and refill planning.
+    ///
+    /// Both row count and stored payload bytes are checked before decoding. An
+    /// oversized inventory is rejected in full; it is never truncated. Defaults
+    /// to no inventory limit. The storage backend must support bounded reads.
+    /// Submitted operations retain their original recovery inputs.
+    pub fn with_proof_inventory_limits(mut self, max_proofs: u32, max_bytes: u32) -> Self {
+        self.proof_inventory_limits = Some((max_proofs, max_bytes));
+        self
+    }
+
+    /// Bound cumulative retained mint metadata, including inactive keysets.
+    ///
+    /// Defaults to no configured limit. Limits must be positive and must match
+    /// any explicitly shared cache. This does not bound database projections or
+    /// transient HTTP replies. Refusal retains existing keys and financial state.
+    pub fn with_mint_metadata_limits(mut self, limits: MintMetadataLimits) -> Self {
+        self.mint_metadata_limits = Some(limits);
         self
     }
 
@@ -258,6 +297,9 @@ impl WalletBuilder {
 
     /// Build the wallet
     pub fn build(mut self) -> Result<Wallet, Error> {
+        if let Some(limits) = self.mint_metadata_limits {
+            limits.validate()?;
+        }
         let mint_url = self
             .mint_url
             .take()
@@ -280,9 +322,29 @@ impl WalletBuilder {
                 cache.clone()
             } else {
                 // Create a new one
-                Arc::new(MintMetadataCache::new(mint_url.clone()))
+                Arc::new(MintMetadataCache::with_limits(
+                    mint_url.clone(),
+                    self.mint_metadata_limits,
+                ))
             }
         });
+
+        if self.mint_metadata_limits.is_some()
+            && metadata_cache.limits() != self.mint_metadata_limits
+        {
+            return Err(Error::Custom(
+                "shared mint metadata limits differ".to_owned(),
+            ));
+        }
+        if metadata_cache.limits().is_some() && self.auth_cat.is_none() {
+            if let Some(auth) = &self.auth_wallet {
+                if !Arc::ptr_eq(&auth.metadata_cache, &metadata_cache) {
+                    return Err(Error::Custom(
+                        "limited wallet and auth wallet must share their metadata cache".to_owned(),
+                    ));
+                }
+            }
+        }
 
         metadata_cache.set_ttl(self.metadata_cache_ttl);
 
@@ -361,6 +423,8 @@ impl WalletBuilder {
             localstore,
             metadata_cache,
             target_proof_count: self.target_proof_count.unwrap_or(3),
+            max_outputs: self.max_outputs,
+            proof_inventory_limits: self.proof_inventory_limits,
             auth_wallet: Arc::new(TokioRwLock::new(auth_wallet)),
             auth_connector: self.auth_connector.take(),
             #[cfg(feature = "npubcash")]
@@ -383,6 +447,63 @@ mod tests {
     fn test_default_ttl() {
         let builder = WalletBuilder::default();
         assert_eq!(builder.metadata_cache_ttl, Some(Duration::from_secs(3600)));
+    }
+
+    #[tokio::test]
+    async fn metadata_limits_reject_zero_and_incompatible_shared_caches() {
+        let limits = MintMetadataLimits {
+            max_keysets: 2,
+            max_bytes: 4096,
+        };
+        for invalid in [
+            MintMetadataLimits {
+                max_keysets: 0,
+                ..limits
+            },
+            MintMetadataLimits {
+                max_bytes: 0,
+                ..limits
+            },
+        ] {
+            assert!(base_builder()
+                .await
+                .with_mint_metadata_limits(invalid)
+                .build()
+                .is_err());
+        }
+        let original = base_builder()
+            .await
+            .with_mint_metadata_limits(limits)
+            .set_auth_cat("cat".to_owned())
+            .unwrap()
+            .build()
+            .unwrap();
+        let cache = original.metadata_cache.clone();
+        let auth = original.auth_wallet.read().await.clone().unwrap();
+        let shared = base_builder()
+            .await
+            .with_mint_metadata_limits(limits)
+            .metadata_cache(cache.clone())
+            .auth_wallet(auth.clone())
+            .build()
+            .unwrap();
+        assert!(Arc::ptr_eq(&shared.metadata_cache, &cache));
+        assert_eq!(shared.metadata_cache.limits(), Some(limits));
+        assert!(base_builder()
+            .await
+            .with_mint_metadata_limits(MintMetadataLimits {
+                max_keysets: 3,
+                ..limits
+            })
+            .metadata_cache(cache)
+            .build()
+            .is_err());
+        assert!(base_builder()
+            .await
+            .with_mint_metadata_limits(limits)
+            .auth_wallet(auth)
+            .build()
+            .is_err());
     }
 
     #[test]

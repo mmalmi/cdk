@@ -11,6 +11,8 @@
 //! 4. Testing the complete quote state transitions
 //! 5. Validating proof generation and verification
 
+#![recursion_limit = "256"]
+
 use std::env;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -47,6 +49,8 @@ async fn create_test_ffi_wallet() -> FfiWallet {
     let mnemonic = Mnemonic::generate(12).unwrap().to_string();
     let config = WalletConfig {
         target_proof_count: Some(3),
+        max_outputs: None,
+        proof_inventory_limits: None,
         rate_limit: None,
     };
 
@@ -301,6 +305,8 @@ async fn test_ffi_minting_error_handling() {
     let mnemonic = Mnemonic::generate(12).unwrap().to_string();
     let config = WalletConfig {
         target_proof_count: Some(3),
+        max_outputs: None,
+        proof_inventory_limits: None,
         rate_limit: None,
     };
 
@@ -357,6 +363,8 @@ async fn test_ffi_wallet_configuration() {
     for target_count in proof_counts {
         let config = WalletConfig {
             target_proof_count: Some(target_count),
+            max_outputs: None,
+            proof_inventory_limits: None,
             rate_limit: None,
         };
 
@@ -382,6 +390,8 @@ async fn test_ffi_wallet_configuration() {
     // Test wallet restoration with same mnemonic
     let config = WalletConfig {
         target_proof_count: Some(3),
+        max_outputs: None,
+        proof_inventory_limits: None,
         rate_limit: None,
     };
 

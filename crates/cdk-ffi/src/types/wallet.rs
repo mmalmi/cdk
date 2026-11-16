@@ -8,10 +8,14 @@ use cdk_common::bitcoin;
 use serde::{Deserialize, Serialize};
 
 use super::amount::{Amount, SplitTarget};
+use super::keys::Id;
 use super::proof::{Proofs, SpendingConditions};
 use crate::error::FfiError;
 use crate::token::Token;
 use crate::{CurrencyUnit, MintUrl, PublicKey};
+
+#[cfg(test)]
+mod send_options_tests;
 
 /// FFI-compatible SendMemo
 #[derive(Debug, Clone, Serialize, Deserialize, uniffi::Record)]
@@ -219,6 +223,9 @@ impl From<cdk::wallet::P2PKLockedProofSendMode> for P2PKLockedProofSendMode {
 /// FFI-compatible Send options
 #[derive(Debug, Clone, Serialize, Deserialize, uniffi::Record)]
 pub struct SendOptions {
+    /// Retain zero-spend cancellation evidence until explicitly acknowledged.
+    #[serde(default)]
+    pub retain_cancellation: bool,
     /// Memo
     pub memo: Option<SendMemo>,
     /// Spending conditions
@@ -232,6 +239,15 @@ pub struct SendOptions {
     pub use_p2bk: bool,
     /// Maximum number of proofs to include in the token
     pub max_proofs: Option<u32>,
+    /// Maximum JSON-encoded bytes of all selected input proofs, as one array.
+    #[serde(default)]
+    pub max_input_bytes: Option<u64>,
+    /// Maximum wallet debit, including token value and all send fees.
+    #[serde(default)]
+    pub max_total_amount: Option<Amount>,
+    /// Require token proofs from the selected active keyset.
+    #[serde(default)]
+    pub required_keyset_id: Option<Id>,
     /// Metadata
     pub metadata: HashMap<String, String>,
     /// Signing keys for P2PK-locked input proofs
@@ -245,12 +261,16 @@ pub struct SendOptions {
 impl Default for SendOptions {
     fn default() -> Self {
         Self {
+            retain_cancellation: false,
             memo: None,
             conditions: None,
             amount_split_target: SplitTarget::None,
             send_kind: SendKind::OnlineExact,
             include_fee: false,
             max_proofs: None,
+            max_input_bytes: None,
+            max_total_amount: None,
+            required_keyset_id: None,
             metadata: HashMap::new(),
             use_p2bk: false,
             p2pk_signing_keys: Vec::new(),
@@ -270,12 +290,16 @@ impl TryFrom<SendOptions> for cdk::wallet::SendOptions {
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok(cdk::wallet::SendOptions {
+            retain_cancellation: opts.retain_cancellation,
             memo: opts.memo.map(Into::into),
             conditions: opts.conditions.map(TryInto::try_into).transpose()?,
             amount_split_target: opts.amount_split_target.into(),
             send_kind: opts.send_kind.into(),
             include_fee: opts.include_fee,
             max_proofs: opts.max_proofs.map(|p| p as usize),
+            max_input_bytes: opts.max_input_bytes,
+            max_total_amount: opts.max_total_amount.map(Into::into),
+            required_keyset_id: opts.required_keyset_id.map(TryInto::try_into).transpose()?,
             metadata: opts.metadata,
             use_p2bk: opts.use_p2bk,
             p2pk_signing_keys,
@@ -287,12 +311,16 @@ impl TryFrom<SendOptions> for cdk::wallet::SendOptions {
 impl From<cdk::wallet::SendOptions> for SendOptions {
     fn from(opts: cdk::wallet::SendOptions) -> Self {
         Self {
+            retain_cancellation: opts.retain_cancellation,
             memo: opts.memo.map(Into::into),
             conditions: opts.conditions.map(Into::into),
             amount_split_target: opts.amount_split_target.into(),
             send_kind: opts.send_kind.into(),
             include_fee: opts.include_fee,
             max_proofs: opts.max_proofs.map(|p| p as u32),
+            max_input_bytes: opts.max_input_bytes,
+            max_total_amount: opts.max_total_amount.map(Into::into),
+            required_keyset_id: opts.required_keyset_id.map(Into::into),
             metadata: opts.metadata,
             use_p2bk: opts.use_p2bk,
             p2pk_signing_keys: opts.p2pk_signing_keys.into_iter().map(Into::into).collect(),
@@ -386,6 +414,10 @@ impl From<cdk::nuts::SecretKey> for SecretKey {
 /// FFI-compatible Receive options
 #[derive(Clone, Serialize, Deserialize, uniffi::Record)]
 pub struct ReceiveOptions {
+    /// Return a retained completed result on retry, without new balance credit.
+    /// Defaults to false so ordinary receives still reject duplicate coins.
+    #[serde(default)]
+    pub replay_completed: bool,
     /// Amount split target
     pub amount_split_target: SplitTarget,
     /// P2PK signing keys
@@ -400,6 +432,7 @@ pub struct ReceiveOptions {
 impl fmt::Debug for ReceiveOptions {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ReceiveOptions")
+            .field("replay_completed", &self.replay_completed)
             .field("amount_split_target", &self.amount_split_target)
             .field("p2pk_signing_keys", &"[REDACTED]")
             .field("preimages", &"[REDACTED]")
@@ -411,6 +444,7 @@ impl fmt::Debug for ReceiveOptions {
 impl Default for ReceiveOptions {
     fn default() -> Self {
         Self {
+            replay_completed: false,
             amount_split_target: SplitTarget::None,
             p2pk_signing_keys: Vec::new(),
             preimages: Vec::new(),
@@ -430,6 +464,7 @@ impl TryFrom<ReceiveOptions> for cdk::wallet::ReceiveOptions {
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok(cdk::wallet::ReceiveOptions {
+            replay_completed: opts.replay_completed,
             amount_split_target: opts.amount_split_target.into(),
             p2pk_signing_keys,
             preimages: opts.preimages,
@@ -441,6 +476,7 @@ impl TryFrom<ReceiveOptions> for cdk::wallet::ReceiveOptions {
 impl From<cdk::wallet::ReceiveOptions> for ReceiveOptions {
     fn from(opts: cdk::wallet::ReceiveOptions) -> Self {
         Self {
+            replay_completed: opts.replay_completed,
             amount_split_target: opts.amount_split_target.into(),
             p2pk_signing_keys: opts.p2pk_signing_keys.into_iter().map(Into::into).collect(),
             preimages: opts.preimages,

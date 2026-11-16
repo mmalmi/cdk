@@ -1837,6 +1837,7 @@ dependencies = [
  "cdk-common",
  "cdk-prometheus",
  "lightning-invoice",
+ "serde",
  "serde_json",
  "thiserror 2.0.20",
  "tokio",

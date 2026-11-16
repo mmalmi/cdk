@@ -43,6 +43,12 @@ use crate::wallet::util::escape_log_value;
 use crate::wallet::{AuthMintConnector, AuthWallet, MintConnector};
 use crate::{Error, Wallet};
 
+mod limits;
+#[cfg(test)]
+mod tests;
+pub use self::limits::MintMetadataLimits;
+use self::limits::{merge_keysets, Budget};
+
 /// Metadata freshness and versioning information
 ///
 /// Tracks when data was last fetched and which version is currently cached.
@@ -116,6 +122,8 @@ pub struct MintMetadata {
 pub struct MintMetadataCache {
     /// The mint server URL this cache manages
     mint_url: MintUrl,
+
+    limits: Option<MintMetadataLimits>,
 
     /// Atomically-updated metadata snapshot (lock-free reads)
     metadata: Arc<ArcSwap<MintMetadata>>,
@@ -193,13 +201,22 @@ impl MintMetadataCache {
     /// // No data loaded yet - call load() to fetch
     /// ```
     pub fn new(mint_url: MintUrl) -> Self {
+        Self::with_limits(mint_url, None)
+    }
+
+    pub(crate) fn with_limits(mint_url: MintUrl, limits: Option<MintMetadataLimits>) -> Self {
         Self {
             mint_url,
+            limits,
             metadata: Arc::new(ArcSwap::default()),
             ttl: Arc::new(RwLock::new(Some(Duration::from_secs(3600)))),
             db_sync_versions: Arc::new(Default::default()),
             fetch_lock: Arc::new(Mutex::new(())),
         }
+    }
+
+    pub(crate) fn limits(&self) -> Option<MintMetadataLimits> {
+        self.limits
     }
 
     /// Set the TTL for cached metadata.
@@ -276,28 +293,39 @@ impl MintMetadataCache {
         client: &Arc<dyn MintConnector + Send + Sync>,
     ) -> Result<Arc<MintMetadata>, Error> {
         // Acquire lock to ensure only one fetch at a time
-        let current_version = self.metadata.load().status.version;
+        let previous = self.metadata.load().status.clone();
         let _guard = self.fetch_lock.lock().await;
 
-        // Check if another caller already updated the cache while we waited
+        // A DB load also advances version, but only HTTP refresh advances time.
+        // Coalesce with another successful refresh, never with database hydration.
         let current_metadata = self.metadata.load().clone();
-        if current_metadata.status.is_populated && current_metadata.status.version > current_version
+        if current_metadata.status.is_populated
+            && current_metadata.status.version > previous.version
+            && current_metadata.status.updated_at > previous.updated_at
         {
-            // Cache was just updated by another caller - return it
+            // Cache was just refreshed by another caller - return it
             tracing::debug!(
                 "Cache was updated while waiting for fetch lock, returning cached data"
             );
             return Ok(current_metadata);
         }
 
-        if !current_metadata.status.is_populated {
-            let _ = self.load_from_db(storage).await;
-        }
+        let baseline = if current_metadata.status.is_populated {
+            current_metadata
+        } else {
+            match self.read_from_db(storage).await {
+                Ok(metadata) => metadata,
+                Err(error @ Error::MintMetadataTooLarge { .. }) => return Err(error),
+                Err(error @ Error::Database(database::Error::MintMetadataReadTooLarge { .. })) => {
+                    return Err(error);
+                }
+                Err(_) => current_metadata,
+            }
+        };
 
-        // Perform the fetch
-        // Note: keys already in cache (e.g. from load_from_db at boot) are
-        // skipped by fetch_from_http's Vacant entry check.
-        let metadata = self.fetch_from_http(Some(client), None).await?;
+        // Reading the database does not publish a partial refresh. Refusal must
+        // preserve the previous cache and freshness, including an empty cache.
+        let metadata = self.fetch_from_http(Some(client), None, baseline).await?;
 
         // Persist to database
         self.database_sync(storage.clone(), metadata.clone()).await;
@@ -333,6 +361,24 @@ impl MintMetadataCache {
         &self,
         storage: &Arc<dyn WalletDatabase<database::Error> + Send + Sync>,
     ) -> Result<Arc<MintMetadata>, Error> {
+        let _guard = self.fetch_lock.lock().await;
+        // A refresh may have admitted keys while this reader waited, even when
+        // their best-effort persistence failed. Never replace them with old DB data.
+        if let Some(metadata) = self.get_cached() {
+            return Ok(metadata);
+        }
+        let metadata = self.read_from_db(storage).await?;
+        self.metadata.store(metadata.clone());
+        self.db_sync_versions
+            .write()
+            .insert(Self::arc_pointer_id(storage), metadata.status.version);
+        Ok(metadata)
+    }
+
+    async fn read_from_db(
+        &self,
+        storage: &Arc<dyn WalletDatabase<database::Error> + Send + Sync>,
+    ) -> Result<Arc<MintMetadata>, Error> {
         let mut new_metadata = (*self.metadata.load().clone()).clone();
 
         // Load mint info
@@ -340,23 +386,21 @@ impl MintMetadataCache {
             new_metadata.mint_info = mint_info;
         }
 
-        // Load keysets and their keys
-        if let Some(keysets) = storage.get_mint_keysets(self.mint_url.clone()).await? {
-            new_metadata.active_keysets.clear();
-            for keyset_info in keysets {
-                let keyset_arc = Arc::new(keyset_info.clone());
-                new_metadata
-                    .keysets
-                    .insert(keyset_info.id, keyset_arc.clone());
-
-                if keyset_info.active {
-                    new_metadata.active_keysets.push(keyset_arc);
-                }
-
-                if let Some(keys) = storage.get_keys(&keyset_info.id).await? {
-                    tracing::trace!("Loaded keys for keyset {} from database", keyset_info.id);
-                    new_metadata.keys.insert(keyset_info.id, Arc::new(keys));
-                }
+        // Database read policies bound stored projections separately from these
+        // cumulative, canonically serialized cache limits.
+        let keysets = storage
+            .get_mint_keysets(self.mint_url.clone())
+            .await?
+            .unwrap_or_default();
+        merge_keysets(&mut new_metadata, &keysets, self.limits)?;
+        let mut budget = Budget::new(&new_metadata, self.limits)?;
+        for keyset_info in keysets {
+            if let Some(keys) = storage.get_keys(&keyset_info.id).await? {
+                budget.replace_keys(
+                    new_metadata.keys.get(&keyset_info.id).map(Arc::as_ref),
+                    &keys,
+                )?;
+                new_metadata.keys.insert(keyset_info.id, Arc::new(keys));
             }
         }
 
@@ -373,17 +417,7 @@ impl MintMetadataCache {
             new_metadata.status.version
         );
 
-        // Atomically update cache
-        let metadata_arc = Arc::new(new_metadata);
-        self.metadata.store(metadata_arc.clone());
-
-        // Mark DB as synced (data came from DB, no need to write back)
-        let storage_id = Self::arc_pointer_id(storage);
-        self.db_sync_versions
-            .write()
-            .insert(storage_id, metadata_arc.status.version);
-
-        Ok(metadata_arc)
+        Ok(Arc::new(new_metadata))
     }
 
     /// Load metadata from cache or fetch if not available
@@ -443,16 +477,20 @@ impl MintMetadataCache {
 
         // In-memory cache was empty (not just stale) — try database before network
         if !cached_metadata.status.is_populated {
-            if let Ok(metadata) = self.load_from_db(storage).await {
-                if metadata.status.is_populated {
-                    return Ok(metadata);
+            match self.load_from_db(storage).await {
+                Ok(metadata) if metadata.status.is_populated => return Ok(metadata),
+                Err(error @ Error::MintMetadataTooLarge { .. }) => return Err(error),
+                Err(error @ Error::Database(database::Error::MintMetadataReadTooLarge { .. })) => {
+                    return Err(error);
                 }
+                _ => {}
             }
         }
 
         // Cache was stale (TTL expired) or neither cache nor DB had data — fetch from mint
         match self.load_from_mint(storage, client).await {
             Ok(metadata) => Ok(metadata),
+            Err(error @ Error::MintMetadataTooLarge { .. }) => Err(error),
             Err(e) if cached_metadata.status.is_populated => {
                 // Network failed but we have usable stale data — return it
                 tracing::warn!(
@@ -529,7 +567,9 @@ impl MintMetadataCache {
         }
 
         // Auth data not in cache - fetch from mint
-        let metadata = self.fetch_from_http(None, Some(auth_client)).await?;
+        let metadata = self
+            .fetch_from_http(None, Some(auth_client), current_metadata)
+            .await?;
 
         // Persist to database
         self.database_sync(storage.clone(), metadata.clone()).await;
@@ -665,14 +705,15 @@ impl MintMetadataCache {
         &self,
         client: Option<&Arc<dyn MintConnector + Send + Sync>>,
         auth_client: Option<&Arc<dyn AuthMintConnector + Send + Sync>>,
+        baseline: Arc<MintMetadata>,
     ) -> Result<Arc<MintMetadata>, Error> {
         tracing::debug!(
             "Fetching mint metadata from HTTP for {}",
             escape_log_value(&self.mint_url)
         );
 
-        // Start with current cache to preserve data from other sources
-        let mut new_metadata = (*self.metadata.load().clone()).clone();
+        // Preserve data from other sources until a complete refresh is admitted.
+        let mut new_metadata = (*baseline).clone();
         let mut keysets_to_fetch = Vec::new();
 
         // Fetch regular mint data
@@ -713,19 +754,11 @@ impl MintMetadataCache {
             escape_log_value(&self.mint_url)
         );
 
-        // Fetch keys for each keyset
-        new_metadata.active_keysets.clear();
+        // Reject the complete identity/known-metadata union before requesting
+        // any missing key. Each key reply then consumes the remaining byte budget.
+        merge_keysets(&mut new_metadata, &keysets_to_fetch, self.limits)?;
+        let mut budget = Budget::new(&new_metadata, self.limits)?;
         for keyset_info in keysets_to_fetch {
-            let keyset_arc = Arc::new(keyset_info.clone());
-            new_metadata
-                .keysets
-                .insert(keyset_info.id, keyset_arc.clone());
-
-            // Track active keysets separately for quick access
-            if keyset_info.active {
-                new_metadata.active_keysets.push(keyset_arc);
-            }
-
             // Only fetch keys if we don't already have them cached
             if let std::collections::hash_map::Entry::Vacant(e) =
                 new_metadata.keys.entry(keyset_info.id)
@@ -746,6 +779,7 @@ impl MintMetadataCache {
 
                 // Verify the keyset ID matches the keys
                 keyset.verify_id()?;
+                budget.replace_keys(None, &keyset.keys)?;
 
                 e.insert(Arc::new(keyset.keys));
             }

@@ -24,7 +24,7 @@ pub enum Error {
 
 /// Preswap information
 #[cfg(feature = "wallet")]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PreSwap {
     /// Preswap mint secrets
     pub pre_mint_secrets: PreMintSecrets,

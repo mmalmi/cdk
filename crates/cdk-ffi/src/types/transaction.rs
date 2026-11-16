@@ -14,9 +14,41 @@ use super::proof::Proofs;
 use super::quote::PaymentMethod;
 use crate::error::FfiError;
 
+/// The operation result represented by a transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, uniffi::Enum, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TransactionRole {
+    /// The ordinary transaction for an operation.
+    #[default]
+    Primary,
+    /// A completed refund owned by the original send operation.
+    SendRefund,
+}
+
+impl From<cdk::wallet::types::TransactionRole> for TransactionRole {
+    fn from(role: cdk::wallet::types::TransactionRole) -> Self {
+        match role {
+            cdk::wallet::types::TransactionRole::Primary => Self::Primary,
+            cdk::wallet::types::TransactionRole::SendRefund => Self::SendRefund,
+        }
+    }
+}
+
+impl From<TransactionRole> for cdk::wallet::types::TransactionRole {
+    fn from(role: TransactionRole) -> Self {
+        match role {
+            TransactionRole::Primary => Self::Primary,
+            TransactionRole::SendRefund => Self::SendRefund,
+        }
+    }
+}
+
 /// FFI-compatible Transaction
 #[derive(Clone, Serialize, Deserialize, uniffi::Record)]
 pub struct Transaction {
+    /// The operation result represented by this transaction.
+    #[serde(default)]
+    pub role: TransactionRole,
     /// Transaction ID
     pub id: TransactionId,
     /// Mint URL
@@ -74,6 +106,7 @@ impl fmt::Debug for Transaction {
             .field("payment_method", &self.payment_method)
             .field("saga_id", &self.saga_id)
             .field("status", &self.status)
+            .field("role", &self.role)
             .finish()
     }
 }
@@ -97,6 +130,7 @@ impl From<cdk::wallet::types::Transaction> for Transaction {
             payment_method: tx.payment_method.map(Into::into),
             saga_id: tx.saga_id.map(|id| id.to_string()),
             status: tx.status.into(),
+            role: tx.role.into(),
         }
     }
 }
@@ -110,7 +144,12 @@ impl TryFrom<Transaction> for cdk::wallet::types::Transaction {
             tx.ys.into_iter().map(|pk| pk.try_into()).collect();
         let cdk_ys = cdk_ys?;
 
-        Ok(Self {
+        let refund_id = if tx.role == TransactionRole::SendRefund {
+            Some(cdk::wallet::types::TransactionId::try_from(tx.id.clone())?)
+        } else {
+            None
+        };
+        let transaction = Self {
             mint_url: tx.mint_url.try_into()?,
             direction: tx.direction.into(),
             amount: tx.amount.into(),
@@ -130,7 +169,15 @@ impl TryFrom<Transaction> for cdk::wallet::types::Transaction {
                 .transpose()
                 .map_err(|e| FfiError::internal(format!("Invalid saga_id: {}", e)))?,
             status: tx.status.into(),
-        })
+            role: tx.role.into(),
+        };
+        transaction.validate_role().map_err(FfiError::from)?;
+        if refund_id.is_some_and(|id| id != transaction.id()) {
+            return Err(FfiError::internal(
+                "Invalid send refund transaction ID".to_owned(),
+            ));
+        }
+        Ok(transaction)
     }
 }
 
@@ -274,6 +321,15 @@ impl TransactionId {
             hex: cdk::wallet::types::TransactionId::from_saga_id(saga_id).to_string(),
         })
     }
+
+    /// Derive a refund receipt ID from its original send saga ID.
+    pub fn from_send_refund(saga_id: String) -> Result<Self, FfiError> {
+        let saga_id = Uuid::from_str(&saga_id)
+            .map_err(|e| FfiError::internal(format!("Invalid saga ID: {e}")))?;
+        Ok(Self {
+            hex: cdk::wallet::types::TransactionId::from_send_refund(saga_id).to_string(),
+        })
+    }
 }
 
 impl From<cdk::wallet::types::TransactionId> for TransactionId {
@@ -375,10 +431,57 @@ mod tests {
     use super::*;
 
     #[test]
+    fn send_refund_roundtrip_preserves_identity_and_parent() {
+        type Native = cdk::wallet::types::Transaction;
+        let saga_id = uuid::Uuid::new_v4();
+        let native = Native {
+            role: cdk::wallet::types::TransactionRole::SendRefund,
+            mint_url: "https://mint.example.com".parse().expect("mint URL"),
+            direction: cdk::wallet::types::TransactionDirection::Incoming,
+            status: cdk::wallet::types::TransactionStatus::Completed,
+            amount: 7.into(),
+            fee: 1.into(),
+            unit: cdk::nuts::CurrencyUnit::Sat,
+            ys: vec![cdk::nuts::SecretKey::generate().public_key()],
+            timestamp: 42,
+            memo: Some("refund".into()),
+            metadata: HashMap::new(),
+            quote_id: None,
+            payment_request: None,
+            payment_proof: None,
+            payment_method: None,
+            saga_id: Some(saga_id),
+        };
+        let ffi = Transaction::from(native.clone());
+        assert_eq!(ffi.role, TransactionRole::SendRefund);
+        assert_eq!(ffi.saga_id, Some(saga_id.to_string()));
+        assert_eq!(
+            ffi.id.hex,
+            TransactionId::from_send_refund(saga_id.to_string())
+                .expect("ID")
+                .hex
+        );
+        let json = encode_transaction(ffi.clone()).expect("encode");
+        assert!(json.contains("\"role\":\"send_refund\""));
+        let decoded = decode_transaction(json).expect("decode");
+        assert_eq!(Native::try_from(decoded).expect("native"), native);
+        let mut wrong_id = ffi.clone();
+        wrong_id.id = TransactionId::from_saga_id(saga_id.to_string()).expect("primary ID");
+        assert!(Native::try_from(wrong_id).is_err());
+        let mut no_parent = ffi.clone();
+        no_parent.saga_id = None;
+        assert!(Native::try_from(no_parent).is_err());
+        let mut pending = ffi;
+        pending.status = TransactionStatus::Pending;
+        assert!(Native::try_from(pending).is_err());
+    }
+
+    #[test]
     fn transaction_and_auth_proof_debug_redact_secrets() {
         let payment_proof = "ffi-transaction-payment-preimage";
         let auth_secret = "ffi-auth-proof-secret";
         let transaction = Transaction {
+            role: TransactionRole::Primary,
             id: TransactionId {
                 hex: "00".repeat(32),
             },

@@ -87,6 +87,7 @@ mod tests {
         assert!(matches!(options.send_kind, SendKind::OnlineExact));
         assert!(!options.include_fee);
         assert!(options.max_proofs.is_none());
+        assert!(options.max_input_bytes.is_none());
         assert!(options.metadata.is_empty());
         assert!(options.p2pk_signing_keys.is_empty());
         assert_eq!(
@@ -202,6 +203,7 @@ mod tests {
         };
 
         let options = SendOptions {
+            retain_cancellation: false,
             memo: Some(memo),
             conditions: Some(conditions),
             amount_split_target: SplitTarget::Value {
@@ -212,6 +214,9 @@ mod tests {
             },
             include_fee: true,
             max_proofs: Some(10),
+            max_input_bytes: Some(4096),
+            max_total_amount: Some(Amount::new(2000)),
+            required_keyset_id: None,
             metadata,
             use_p2bk: false,
             p2pk_signing_keys: Vec::new(),
@@ -230,7 +235,14 @@ mod tests {
         ));
         assert!(options.include_fee);
         assert_eq!(options.max_proofs, Some(10));
+        assert_eq!(options.max_input_bytes, Some(4096));
         assert!(!options.metadata.is_empty());
+        let decoded =
+            crate::types::wallet::decode_send_options(options.to_json().unwrap()).unwrap();
+        let native: cdk::wallet::SendOptions = decoded.try_into().unwrap();
+        assert_eq!(native.max_input_bytes, Some(4096));
+        let restored = SendOptions::from(native);
+        assert_eq!(restored.max_input_bytes, Some(4096));
     }
 
     #[test]
@@ -242,6 +254,7 @@ mod tests {
         metadata.insert("key1".to_string(), "value1".to_string());
 
         let options = ReceiveOptions {
+            replay_completed: true,
             amount_split_target: SplitTarget::Values {
                 amounts: vec![Amount::new(100), Amount::new(200)],
             },
@@ -257,11 +270,24 @@ mod tests {
         assert_eq!(options.p2pk_signing_keys.len(), 1);
         assert_eq!(options.preimages.len(), 2);
         assert!(!options.metadata.is_empty());
+        let native: cdk::wallet::ReceiveOptions =
+            crate::types::wallet::decode_receive_options(options.to_json().unwrap())
+                .unwrap()
+                .try_into()
+                .unwrap();
+        assert!(native.replay_completed);
+        assert!(ReceiveOptions::from(native).replay_completed);
+        assert!(!ReceiveOptions::default().replay_completed);
+        let mut json = serde_json::to_value(&options).unwrap();
+        json.as_object_mut().unwrap().remove("replay_completed");
+        let decoded = crate::types::wallet::decode_receive_options(json.to_string()).unwrap();
+        assert!(!decoded.replay_completed);
     }
 
     #[test]
     fn test_receive_options_invalid_secret_key_returns_error() {
         let options = ReceiveOptions {
+            replay_completed: false,
             amount_split_target: SplitTarget::None,
             p2pk_signing_keys: vec![SecretKey {
                 hex: "z".repeat(64),
@@ -447,6 +473,7 @@ mod tests {
     #[test]
     fn test_transaction_invalid_saga_id_returns_error() {
         let transaction = Transaction {
+            role: Default::default(),
             id: TransactionId {
                 hex: "a".repeat(64),
             },
@@ -505,12 +532,16 @@ mod tests {
     fn test_wallet_config() {
         let config = WalletConfig {
             target_proof_count: None,
+            max_outputs: None,
+            proof_inventory_limits: None,
             rate_limit: None,
         };
         assert!(config.target_proof_count.is_none());
 
         let config_with_values = WalletConfig {
             target_proof_count: Some(5),
+            max_outputs: Some(1024),
+            proof_inventory_limits: None,
             rate_limit: None,
         };
         assert_eq!(config_with_values.target_proof_count, Some(5));

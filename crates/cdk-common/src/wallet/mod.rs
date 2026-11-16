@@ -24,12 +24,15 @@ use crate::nuts::{
 use crate::rate_limit::RateLimitConfig;
 use crate::{Amount, Error};
 
+pub mod receive_identity;
 pub mod saga;
 
-pub use saga::{
-    IssueSagaState, MeltOperationData, MeltSagaState, MintOperationData, OperationData,
-    ReceiveOperationData, ReceiveSagaState, SendOperationData, SendSagaState, SwapOperationData,
-    SwapSagaState, WalletSaga, WalletSagaState,
+pub use self::saga::{
+    IssueSagaState, MeltOperationData, MeltPayment, MeltSagaState, MeltSwap, MintCheckpoint,
+    MintOperationData, MintRequestData, OperationData, ReceiveCheckpoint, ReceiveOperationData,
+    ReceiveSagaState, SendConfirmation, SendOperationData, SendPreparation, SendReclaim,
+    SendSagaState, SwapCheckpoint, SwapOperationData, SwapOutputs, SwapSagaState, WalletSaga,
+    WalletSagaState,
 };
 
 /// Wallet Key
@@ -459,6 +462,9 @@ impl NUT13Options {
 /// Send options
 #[derive(Clone, Default)]
 pub struct SendOptions {
+    /// Retain zero-spend cancellation evidence until explicitly acknowledged.
+    /// Select before preparation when the application durably tracks this send.
+    pub retain_cancellation: bool,
     /// Memo
     pub memo: Option<SendMemo>,
     /// Spending conditions
@@ -471,6 +477,16 @@ pub struct SendOptions {
     pub include_fee: bool,
     /// Maximum number of proofs to include in the token
     pub max_proofs: Option<usize>,
+    /// Maximum JSON-encoded bytes of all selected input proofs, as one array.
+    /// Checked before saving preparation or reserving coins, and again at confirmation.
+    /// None disables the limit.
+    pub max_input_bytes: Option<u64>,
+    /// Maximum wallet debit, including token value, redemption reserve and swap fees.
+    /// Checked before reserving inputs and again before confirmation spends them.
+    pub max_total_amount: Option<Amount>,
+    /// Require token proofs to use this keyset, which must be the selected active keyset.
+    /// Online sends may swap selected older proofs; offline sends cannot convert them.
+    pub required_keyset_id: Option<Id>,
     /// Metadata
     pub metadata: HashMap<String, String>,
     /// Use P2BK (NUT-28)
@@ -484,12 +500,16 @@ pub struct SendOptions {
 impl fmt::Debug for SendOptions {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SendOptions")
+            .field("retain_cancellation", &self.retain_cancellation)
             .field("memo", &self.memo)
             .field("conditions", &self.conditions)
             .field("amount_split_target", &self.amount_split_target)
             .field("send_kind", &self.send_kind)
             .field("include_fee", &self.include_fee)
             .field("max_proofs", &self.max_proofs)
+            .field("max_input_bytes", &self.max_input_bytes)
+            .field("max_total_amount", &self.max_total_amount)
+            .field("required_keyset_id", &self.required_keyset_id)
             .field("metadata", &self.metadata)
             .field("use_p2bk", &self.use_p2bk)
             .field("p2pk_signing_keys", &"[redacted]")
@@ -533,6 +553,10 @@ impl SendMemo {
 /// Receive options
 #[derive(Clone, Default)]
 pub struct ReceiveOptions {
+    /// Return a matching retained completed receipt's original amount on retry.
+    /// This reports no new balance credit. Defaults to false, which rejects
+    /// already-received coins; receipt retirement always releases this result.
+    pub replay_completed: bool,
     /// Amount split target
     pub amount_split_target: SplitTarget,
     /// P2PK signing keys
@@ -546,6 +570,7 @@ pub struct ReceiveOptions {
 impl fmt::Debug for ReceiveOptions {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ReceiveOptions")
+            .field("replay_completed", &self.replay_completed)
             .field("amount_split_target", &self.amount_split_target)
             .field("p2pk_signing_keys", &"[redacted]")
             .field("preimages", &"[redacted]")
@@ -593,6 +618,9 @@ impl SendKind {
 /// Wallet Transaction
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Transaction {
+    /// The operation result represented by this transaction.
+    #[serde(default)]
+    pub role: TransactionRole,
     /// Mint Url
     pub mint_url: MintUrl,
     /// Transaction direction
@@ -650,6 +678,7 @@ impl fmt::Debug for Transaction {
             .field("payment_method", &self.payment_method)
             .field("saga_id", &self.saga_id)
             .field("status", &self.status)
+            .field("role", &self.role)
             .finish()
     }
 }
@@ -657,17 +686,65 @@ impl fmt::Debug for Transaction {
 impl Transaction {
     /// Transaction ID.
     ///
-    /// Saga-managed transactions are identified by their saga ID so that
+    /// Most saga-managed transactions are identified by their saga ID so that
     /// separate wallet operations involving the same proofs do not collide.
-    /// Legacy transactions without a saga ID retain their proof-derived ID.
+    /// Refund receipts use a separate domain of the original send saga ID.
+    /// Received-token receipts use their immutable coin fingerprint, while the
+    /// saga ID remains unique to each attempt for concurrency control.
+    /// Primary transactions without a saga ID retain their proof-derived ID.
+    /// Call [`Self::validate_role`] before persisting a refund: it requires a saga ID.
     pub fn id(&self) -> TransactionId {
+        if let Some(fingerprint) = self.metadata.get(receive_identity::METADATA_KEY) {
+            return TransactionId::from_receive_fingerprint(fingerprint);
+        }
         match self.saga_id {
+            Some(saga_id) if self.role == TransactionRole::SendRefund => {
+                TransactionId::from_send_refund(saga_id)
+            }
             Some(saga_id) => match self.metadata.get("batch_quote_id") {
                 Some(quote_id) => TransactionId::from_batch_quote(saga_id, quote_id),
                 None => TransactionId::from_saga_id(saga_id),
             },
             None => TransactionId::new(self.ys.clone()),
         }
+    }
+
+    /// Validate the canonical shape of a send-refund receipt before persistence.
+    ///
+    /// Refunds belong to the original send saga and cannot carry payment or
+    /// batch-quote identity fields. Primary transactions retain their existing shape.
+    pub fn validate_role(&self) -> Result<(), Error> {
+        if let Some(fingerprint) = self.metadata.get(receive_identity::METADATA_KEY) {
+            if self.role != TransactionRole::Primary
+                || self.direction != TransactionDirection::Incoming
+                || self.status != TransactionStatus::Completed
+                || self.saga_id.is_none()
+                || self.quote_id.is_some()
+                || self.payment_request.is_some()
+                || self.payment_proof.is_some()
+                || self.payment_method.is_some()
+                || self.metadata.contains_key("batch_quote_id")
+                || fingerprint.len() != 64
+                || !fingerprint
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            {
+                return Err(Error::InvalidTransactionRole);
+            }
+        }
+        if self.role == TransactionRole::SendRefund
+            && (self.saga_id.is_none()
+                || self.direction != TransactionDirection::Incoming
+                || self.status != TransactionStatus::Completed
+                || self.quote_id.is_some()
+                || self.payment_request.is_some()
+                || self.payment_proof.is_some()
+                || self.payment_method.is_some()
+                || self.metadata.contains_key("batch_quote_id"))
+        {
+            return Err(Error::InvalidTransactionRole);
+        }
+        Ok(())
     }
 
     /// Check if transaction matches conditions
@@ -708,6 +785,38 @@ impl Ord for Transaction {
             .cmp(&other.timestamp)
             .reverse()
             .then_with(|| self.id().cmp(&other.id()))
+    }
+}
+
+/// The durable result represented by a wallet transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TransactionRole {
+    /// The ordinary transaction for a wallet operation.
+    #[default]
+    Primary,
+    /// A completed refund of a send, owned by the original send saga.
+    SendRefund,
+}
+
+impl fmt::Display for TransactionRole {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Primary => "primary",
+            Self::SendRefund => "send_refund",
+        })
+    }
+}
+
+impl FromStr for TransactionRole {
+    type Err = Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "primary" => Ok(Self::Primary),
+            "send_refund" => Ok(Self::SendRefund),
+            _ => Err(Error::InvalidTransactionRole),
+        }
     }
 }
 
@@ -819,6 +928,22 @@ impl TransactionId {
             *destination = source;
         }
         Self(bytes)
+    }
+
+    /// Derive a received-token receipt ID from its immutable coin fingerprint.
+    pub fn from_receive_fingerprint(fingerprint: &str) -> Self {
+        let mut hasher = sha256::Hash::engine();
+        hasher.input(b"cdk:transaction:receive:v1\0");
+        hasher.input(fingerprint.as_bytes());
+        Self(sha256::Hash::from_engine(hasher).to_byte_array())
+    }
+
+    /// Derive the distinct refund receipt ID from the original send saga.
+    pub fn from_send_refund(saga_id: Uuid) -> Self {
+        let mut hasher = sha256::Hash::engine();
+        hasher.input(b"cdk:transaction:send-refund:v1\0");
+        hasher.input(saga_id.as_bytes());
+        Self(sha256::Hash::from_engine(hasher).to_byte_array())
     }
 
     /// Create a stable transaction ID for one quote within a batch saga.
@@ -1108,6 +1233,18 @@ pub trait Wallet: Send + Sync {
     /// Get a transaction by ID
     async fn get_transaction(&self, id: TransactionId) -> Result<Option<Transaction>, Self::Error>;
 
+    /// Retire exact completed outgoing token history after the owner releases retry rights.
+    async fn retire_send_transactions(
+        &self,
+        expected: Vec<Transaction>,
+    ) -> Result<bool, Self::Error>;
+
+    /// Retire exact completed incoming token history after the owner releases result rights.
+    async fn retire_incoming_transactions(
+        &self,
+        expected: Vec<Transaction>,
+    ) -> Result<bool, Self::Error>;
+
     /// Get proofs for a transaction by transaction ID
     async fn get_proofs_for_transaction(&self, id: TransactionId) -> Result<Proofs, Self::Error>;
 
@@ -1119,6 +1256,9 @@ pub trait Wallet: Send + Sync {
 
     /// Recover from incomplete operations after a crash
     async fn recover_incomplete_sagas(&self) -> Result<Self::RecoveryReport, Self::Error>;
+
+    /// Query mint states in proof order without changing local wallet records.
+    async fn check_proofs_state(&self, proofs: Proofs) -> Result<Vec<ProofState>, Self::Error>;
 
     /// Check if proofs are spent
     async fn check_proofs_spent(&self, proofs: Proofs) -> Result<Vec<ProofState>, Self::Error>;
@@ -1158,6 +1298,28 @@ pub trait Wallet: Send + Sync {
 
     /// Get pending send operation IDs
     async fn get_pending_sends(&self) -> Result<Vec<Self::OperationId>, Self::Error>;
+
+    /// Resume one persisted send confirmation without processing other operations.
+    async fn recover_send_confirmation(
+        &self,
+        operation_id: Self::OperationId,
+    ) -> Result<(), Self::Error>;
+
+    /// Cancel an exact preparation with retained zero-spend evidence.
+    async fn cancel_prepared_send(
+        &self,
+        operation_id: Self::OperationId,
+        amount: Self::Amount,
+        inputs: Proofs,
+    ) -> Result<(), Self::Error>;
+
+    /// Acknowledge a cancellation after durably recording its result.
+    async fn acknowledge_prepared_cancellation(
+        &self,
+        operation_id: Self::OperationId,
+        amount: Self::Amount,
+        inputs: Proofs,
+    ) -> Result<(), Self::Error>;
 
     /// Revoke a pending send operation
     async fn revoke_send(
@@ -1453,6 +1615,7 @@ mod tests {
     fn saga_managed_transactions_with_the_same_ys_have_distinct_ids() {
         let ys = vec![SecretKey::generate().public_key()];
         let transaction = Transaction {
+            role: Default::default(),
             mint_url: MintUrl::from_str("https://mint.example.com").expect("valid mint URL"),
             direction: TransactionDirection::Outgoing,
             amount: Amount::from(10),
@@ -1594,6 +1757,7 @@ mod tests {
             version: 0,
         };
         let transaction = Transaction {
+            role: Default::default(),
             mint_url,
             direction: TransactionDirection::Outgoing,
             amount: Amount::from(10),
@@ -1690,6 +1854,37 @@ mod tests {
     }
 
     #[test]
+    fn refund_identity_is_domain_separated_from_primary_and_batch() {
+        let saga_id = Uuid::parse_str("01234567-89ab-cdef-0123-456789abcdef").expect("UUID");
+        let refund = TransactionId::from_send_refund(saga_id);
+        assert_eq!(
+            refund.to_string(),
+            "ffd07a358e2d197291fa0b1829b517b6c86c785519be1d4e66c8159c02427b6c"
+        );
+        assert_ne!(refund, TransactionId::from_saga_id(saga_id));
+        assert_ne!(
+            refund,
+            TransactionId::from_batch_quote(saga_id, "send_refund")
+        );
+        assert_ne!(refund, TransactionId::from_send_refund(Uuid::nil()));
+        for role in [TransactionRole::Primary, TransactionRole::SendRefund] {
+            assert_eq!(
+                TransactionRole::from_str(&role.to_string()).expect("role"),
+                role
+            );
+            assert_eq!(
+                serde_json::from_str::<TransactionRole>(
+                    &serde_json::to_string(&role).expect("JSON")
+                )
+                .expect("role JSON"),
+                role
+            );
+        }
+        assert!(TransactionRole::from_str("refund").is_err());
+        assert!(serde_json::from_str::<TransactionRole>("\"refund\"").is_err());
+    }
+
+    #[test]
     fn transaction_status_round_trips_and_rejects_unknown_values() {
         for status in [
             TransactionStatus::Pending,
@@ -1711,6 +1906,7 @@ mod tests {
     #[test]
     fn transaction_without_status_defaults_to_completed() {
         let transaction = Transaction {
+            role: Default::default(),
             mint_url: MintUrl::from_str("https://mint.example.com").expect("valid mint URL"),
             direction: TransactionDirection::Incoming,
             amount: Amount::from(10),
@@ -1732,10 +1928,12 @@ mod tests {
             .as_object_mut()
             .expect("transaction serializes as an object")
             .remove("status");
+        value.as_object_mut().expect("object").remove("role");
 
         let decoded: Transaction =
             serde_json::from_value(value).expect("deserialize legacy transaction");
 
         assert_eq!(decoded.status, TransactionStatus::Completed);
+        assert_eq!(decoded.role, TransactionRole::Primary);
     }
 }

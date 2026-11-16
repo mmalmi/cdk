@@ -1,65 +1,42 @@
-//! Receive Saga - Type State Pattern Implementation
-//!
-//! This module implements the saga pattern for receive operations using the typestate
-//! pattern to enforce valid state transitions at compile-time.
-//!
-//! # State Flow
-//!
-//! ```text
-//! [saga created] ──► ProofsPending ──► SwapRequested ──► [completed]
-//!                         │                  │
-//!                         │                  ├─ replay succeeds ───► [completed]
-//!                         │                  ├─ proofs spent ──────► [completed] (via /restore)
-//!                         │                  ├─ proofs not spent ──► [compensated]
-//!                         │                  └─ mint unreachable ──► [skipped]
-//!                         │
-//!                         └─ recovery ─────────────────────────────► [compensated]
-//! ```
-//!
-//! # States
-//!
-//! | State | Description |
-//! |-------|-------------|
-//! | `ProofsPending` | Input proofs validated and stored as pending, ready to swap for new proofs |
-//! | `SwapRequested` | Swap request sent to mint, awaiting signatures for new proofs |
-//!
-//! # Recovery Outcomes
-//!
-//! | Outcome | Description |
-//! |---------|-------------|
-//! | `[completed]` | Receive succeeded, new proofs saved to wallet |
-//! | `[compensated]` | Receive failed, pending input proofs removed |
-//! | `[skipped]` | Recovery deferred (mint unreachable), will retry on next recovery |
+//! Durable receive preparation and typestate entry points.
 
 use std::collections::HashMap;
 
 use bitcoin::hashes::sha256::Hash as Sha256Hash;
 use bitcoin::hashes::Hash;
 use bitcoin::XOnlyPublicKey;
-use cdk_common::util::unix_time;
-use cdk_common::wallet::{
-    OperationData, ProofInfo, ReceiveOperationData, ReceiveSagaState, Transaction,
-    TransactionDirection, TransactionStatus, WalletSaga, WalletSagaState,
-};
 use tracing::instrument;
 
-use self::compensation::RemovePendingProofs;
 use self::state::{Finalized, Initial, Prepared};
 use super::ReceiveOptions;
-use crate::dhke::construct_proofs;
 use crate::nuts::nut00::ProofsMethods;
 use crate::nuts::nut10::Kind;
-use crate::nuts::{Conditions, Proofs, PublicKey, SecretKey, SigFlag, State};
+use crate::nuts::{Conditions, Proofs, PublicKey, SecretKey, SigFlag};
 use crate::util::hex;
-use crate::wallet::saga::{
-    add_compensation, clear_compensations, execute_compensations, new_compensations, Compensations,
-};
-use crate::wallet::swap::ProofReservation;
 use crate::{Amount, Error, Wallet, SECP256K1};
 
-pub(crate) mod compensation;
+mod admission;
+#[cfg(test)]
+mod completion_tests;
+#[cfg(test)]
+mod custody_tests;
+mod execute;
+mod finish;
+#[cfg(test)]
+mod inactive_keyset_tests;
+mod receipt;
+#[cfg(test)]
+mod recovery_tests;
+#[cfg(test)]
+mod replay_tests;
+#[cfg(test)]
+mod request_tests;
 pub(crate) mod resume;
 pub(crate) mod state;
+#[cfg(test)]
+mod storage_tests;
+#[cfg(test)]
+mod test_utils;
 
 /// Saga pattern implementation for receive operations.
 ///
@@ -69,8 +46,6 @@ pub(crate) mod state;
 pub(crate) struct ReceiveSaga<'a, S> {
     /// Wallet reference
     wallet: &'a Wallet,
-    /// Compensating actions in LIFO order (most recent first)
-    compensations: Compensations,
     /// State-specific data
     state_data: S,
 }
@@ -82,7 +57,6 @@ impl<'a> ReceiveSaga<'a, Initial> {
 
         Self {
             wallet,
-            compensations: new_compensations(),
             state_data: Initial {
                 operation_id,
                 keyset_policy: Default::default(),
@@ -100,7 +74,6 @@ impl<'a> ReceiveSaga<'a, Initial> {
         proofs: Proofs,
         opts: ReceiveOptions,
         memo: Option<String>,
-        token: Option<String>,
     ) -> Result<ReceiveSaga<'a, Prepared>, Error> {
         tracing::info!(
             "Preparing receive for {} proofs with operation {}",
@@ -120,7 +93,7 @@ impl<'a> ReceiveSaga<'a, Initial> {
         let mut proofs = proofs;
         let proofs_amount = proofs.total_amount()?;
 
-        let mut _sig_flag = SigFlag::SigInputs;
+        let mut derived_signing_keys = HashMap::new();
 
         // Map hash of preimage to preimage
         let hashed_to_preimage: HashMap<String, &String> = opts
@@ -216,6 +189,8 @@ impl<'a> ReceiveSaga<'a, Initial> {
                                             pubkey,
                                         )
                                     {
+                                        derived_signing_keys
+                                            .insert(x_only_pubkey, derived_key.clone());
                                         proof.sign_p2pk(derived_key)?;
                                         break;
                                     }
@@ -226,26 +201,23 @@ impl<'a> ReceiveSaga<'a, Initial> {
                         }
                     }
 
-                    match secret.kind() {
-                        Kind::P2PK => proof.verify_p2pk()?,
-                        Kind::HTLC => proof.verify_htlc()?,
-                    }
-
-                    if conditions.sig_flag.eq(&SigFlag::SigAll) {
-                        _sig_flag = SigFlag::SigAll;
+                    if conditions.sig_flag != SigFlag::SigAll {
+                        match secret.kind() {
+                            Kind::P2PK => proof.verify_p2pk()?,
+                            Kind::HTLC => proof.verify_htlc()?,
+                        }
                     }
                 }
             }
         }
 
+        p2pk_signing_keys.extend(derived_signing_keys);
         Ok(ReceiveSaga {
             wallet: self.wallet,
-            compensations: self.compensations,
             state_data: Prepared {
                 operation_id: self.state_data.operation_id,
                 options: opts,
                 memo,
-                token,
                 proofs,
                 proofs_amount,
                 active_keyset_id,
@@ -256,254 +228,6 @@ impl<'a> ReceiveSaga<'a, Initial> {
 }
 
 impl<'a> ReceiveSaga<'a, Prepared> {
-    /// Execute the receive operation.
-    ///
-    /// Stores proofs in Pending state, executes the swap, stores new proofs,
-    /// and records the transaction. On failure, removes pending proofs.
-    #[instrument(skip_all)]
-    pub async fn execute(mut self) -> Result<ReceiveSaga<'a, Finalized>, Error> {
-        tracing::info!(
-            "Executing receive for operation {}",
-            self.state_data.operation_id
-        );
-
-        let fee_and_amounts = self
-            .wallet
-            .get_keyset_fees_and_amounts_by_id(self.state_data.active_keyset_id)
-            .await?;
-
-        let keys = self
-            .wallet
-            .keyset(self.state_data.active_keyset_id)
-            .await?
-            .keys;
-
-        let proofs = self.state_data.proofs.clone();
-        let proofs_ys = proofs.ys()?;
-
-        let fee_breakdown = self.wallet.get_proofs_fee(&proofs).await?;
-
-        let operation_id = self.state_data.operation_id;
-
-        let proofs_info = proofs
-            .clone()
-            .into_iter()
-            .map(|p| {
-                ProofInfo::new_with_operations(
-                    p,
-                    self.wallet.mint_url.clone(),
-                    State::Pending,
-                    self.wallet.unit.clone(),
-                    Some(operation_id),
-                    None,
-                )
-            })
-            .collect::<Result<Vec<ProofInfo>, _>>()?;
-
-        self.wallet
-            .localstore
-            .update_proofs(proofs_info.clone(), vec![])
-            .await?;
-
-        let mut saga = WalletSaga::new(
-            operation_id,
-            WalletSagaState::Receive(ReceiveSagaState::ProofsPending),
-            self.state_data.proofs_amount,
-            self.wallet.mint_url.clone(),
-            self.wallet.unit.clone(),
-            OperationData::Receive(ReceiveOperationData {
-                token: self.state_data.token.clone(),
-                counter_start: None,
-                counter_end: None,
-                amount: Some(self.state_data.proofs_amount),
-                blinded_messages: None,
-            }),
-        );
-
-        self.wallet.localstore.add_saga(saga.clone()).await?;
-
-        add_compensation(
-            &mut self.compensations,
-            Box::new(RemovePendingProofs {
-                localstore: self.wallet.localstore.clone(),
-                proof_ys: proofs_info.iter().map(|p| p.y).collect(),
-                saga_id: operation_id,
-            }),
-        )
-        .await;
-
-        let mut pre_swap = self
-            .wallet
-            .create_swap(
-                &operation_id,
-                self.state_data.active_keyset_id,
-                &fee_and_amounts,
-                None,
-                self.state_data.options.amount_split_target.clone(),
-                proofs,
-                None,
-                false,
-                false,
-                &fee_breakdown,
-                ProofReservation::Skip,
-            )
-            .await?;
-
-        // Determine if SigAll signing is needed
-        let sig_flag = self.determine_sig_flag()?;
-        if sig_flag == SigFlag::SigAll {
-            for blinded_message in pre_swap.swap_request.outputs_mut() {
-                for signing_key in self.state_data.p2pk_signing_keys.values() {
-                    // Sign the outputs of the swap using standard P2PK since output
-                    // P2BK requires ephemeral keys which is handled at creation.
-                    blinded_message.sign_p2pk(signing_key.to_owned().clone())?
-                }
-            }
-        }
-
-        // Get counter range for recovery (before the swap request is sent)
-        let counter_end = self
-            .wallet
-            .localstore
-            .increment_keyset_counter(&self.state_data.active_keyset_id, 0)
-            .await?;
-        let counter_start = counter_end.saturating_sub(pre_swap.derived_secret_count);
-
-        // Update saga state to SwapRequested BEFORE making the mint call.
-        // This is write-ahead logging - if a crash occurs after this, recovery knows
-        // the swap may have been attempted.
-        saga.update_state(WalletSagaState::Receive(ReceiveSagaState::SwapRequested));
-        if let OperationData::Receive(ref mut data) = saga.data {
-            data.counter_start = Some(counter_start);
-            data.counter_end = Some(counter_end);
-            data.blinded_messages = Some(pre_swap.swap_request.outputs().clone());
-        }
-
-        // Update saga state - if this fails due to version conflict, another instance
-        // is processing this saga, which should not happen during normal operation.
-        if !self.wallet.localstore.update_saga(saga).await? {
-            return Err(Error::ConcurrentUpdate);
-        }
-
-        let total_amount = self
-            .state_data
-            .proofs_amount
-            .checked_sub(fee_breakdown.total)
-            .unwrap_or(Amount::ZERO);
-        self.wallet
-            .upsert_transaction(Transaction {
-                mint_url: self.wallet.mint_url.clone(),
-                direction: TransactionDirection::Incoming,
-                amount: total_amount,
-                fee: fee_breakdown.total,
-                unit: self.wallet.unit.clone(),
-                ys: proofs_ys.clone(),
-                timestamp: unix_time(),
-                memo: self.state_data.memo.clone(),
-                metadata: self.state_data.options.metadata.clone(),
-                quote_id: None,
-                payment_request: None,
-                payment_proof: None,
-                payment_method: None,
-                saga_id: Some(operation_id),
-                status: TransactionStatus::Pending,
-            })
-            .await?;
-
-        let swap_response = match self.wallet.client.post_swap(pre_swap.swap_request).await {
-            Ok(response) => response,
-            Err(err) => {
-                if err.is_definitive_failure() {
-                    tracing::error!("Failed to post swap request (definitive): {}", err);
-                    self.wallet.mark_transaction_failed(operation_id).await?;
-                    execute_compensations(&mut self.compensations).await?;
-                } else {
-                    tracing::warn!("Failed to post swap request (ambiguous): {}.", err,);
-                }
-                return Err(err);
-            }
-        };
-
-        let recv_proofs = construct_proofs(
-            swap_response.signatures,
-            pre_swap.pre_mint_secrets.rs(),
-            pre_swap.pre_mint_secrets.secrets(),
-            &keys,
-        )?;
-
-        self.wallet
-            .localstore
-            .increment_keyset_counter(&self.state_data.active_keyset_id, recv_proofs.len() as u32)
-            .await?;
-
-        let total_amount = recv_proofs.total_amount()?;
-        let fee = self.state_data.proofs_amount - total_amount;
-
-        let recv_proof_infos = recv_proofs
-            .into_iter()
-            .zip(&pre_swap.pre_mint_secrets.secrets)
-            .map(|(proof, premint)| {
-                let proof_info = ProofInfo::new(
-                    proof,
-                    self.wallet.mint_url.clone(),
-                    State::Unspent,
-                    self.wallet.unit.clone(),
-                )?;
-                Ok::<_, Error>(match premint.derivation_index {
-                    Some(index) => proof_info.with_derivation_index(index),
-                    None => proof_info,
-                })
-            })
-            .collect::<Result<Vec<ProofInfo>, _>>()?;
-
-        self.wallet
-            .localstore
-            .update_proofs(
-                recv_proof_infos,
-                proofs_info.into_iter().map(|p| p.y).collect(),
-            )
-            .await?;
-
-        self.wallet
-            .upsert_transaction(Transaction {
-                mint_url: self.wallet.mint_url.clone(),
-                direction: TransactionDirection::Incoming,
-                amount: total_amount,
-                fee,
-                unit: self.wallet.unit.clone(),
-                ys: proofs_ys,
-                timestamp: unix_time(),
-                memo: self.state_data.memo.clone(),
-                metadata: self.state_data.options.metadata.clone(),
-                quote_id: None,
-                payment_request: None,
-                payment_proof: None,
-                payment_method: None,
-                saga_id: Some(operation_id),
-                status: TransactionStatus::Completed,
-            })
-            .await?;
-
-        clear_compensations(&mut self.compensations).await;
-
-        if let Err(e) = self.wallet.localstore.delete_saga(&operation_id).await {
-            tracing::warn!(
-                "Failed to delete receive saga {}: {}. Will be cleaned up on recovery.",
-                operation_id,
-                e
-            );
-            // Don't fail the receive if saga deletion fails - orphaned saga is harmless.
-        }
-
-        Ok(ReceiveSaga {
-            wallet: self.wallet,
-            compensations: self.compensations,
-            state_data: Finalized {
-                amount: total_amount,
-            },
-        })
-    }
-
     /// Determine the signature flag based on the proofs
     fn determine_sig_flag(&self) -> Result<SigFlag, Error> {
         for proof in &self.state_data.proofs {
@@ -539,7 +263,10 @@ impl<'a> ReceiveSaga<'a, Finalized> {
 // Required import for PublicKey::from_str
 use std::str::FromStr;
 
-impl<S: std::fmt::Debug> std::fmt::Debug for ReceiveSaga<'_, S> {
+impl<S> std::fmt::Debug for ReceiveSaga<'_, S>
+where
+    S: std::fmt::Debug,
+{
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ReceiveSaga")
             .field("state_data", &self.state_data)

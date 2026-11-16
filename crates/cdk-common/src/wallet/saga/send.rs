@@ -11,20 +11,47 @@ use crate::{Amount, Error};
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SendSagaState {
+    /// Exact reservation intent saved; acquisition may not yet have committed.
+    PreparedAcquiring,
     /// Proofs selected and reserved for sending, ready to create token
     ProofsReserved,
+    /// Cancellation fenced against confirmation; release only the saved inputs.
+    PreparedCancelling,
+    /// Inputs released without a mint submission; retain until acknowledged.
+    PreparedCancelled,
+    /// Exact confirmation saved; the mint may already have spent the inputs.
+    Confirming,
     /// Token created and ready to share, proofs marked as pending spent awaiting claim
     TokenCreated,
-    /// Rollback in progress, reclaiming proofs via swap (transient state)
+    /// Rollback without exact output evidence; retained during recovery.
     RollingBack,
+    /// Exact reclaim intent saved before acquiring the token inputs.
+    ReclaimPreparing,
+    /// Reclaim admission withdrawn; release only its unchanged acquired inputs.
+    ReclaimCancelling,
+    /// Exact reclaim request retained until replacement coins and receipt commit.
+    Reclaiming,
+    /// Refund receipt committed; finish outgoing history before deleting the saga.
+    Reclaimed,
+    /// Recipient claim fenced against concurrent reclaim.
+    Claimed,
 }
 
 impl std::fmt::Display for SendSagaState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::PreparedAcquiring => write!(f, "prepared_acquiring"),
+            Self::PreparedCancelling => write!(f, "prepared_cancelling"),
+            Self::PreparedCancelled => write!(f, "prepared_cancelled"),
+            SendSagaState::Confirming => write!(f, "confirming"),
             SendSagaState::ProofsReserved => write!(f, "proofs_reserved"),
             SendSagaState::TokenCreated => write!(f, "token_created"),
             SendSagaState::RollingBack => write!(f, "rolling_back"),
+            Self::ReclaimPreparing => write!(f, "reclaim_preparing"),
+            Self::ReclaimCancelling => write!(f, "reclaim_cancelling"),
+            Self::Reclaiming => write!(f, "reclaiming"),
+            Self::Reclaimed => write!(f, "reclaimed"),
+            Self::Claimed => write!(f, "claimed"),
         }
     }
 }
@@ -33,9 +60,18 @@ impl std::str::FromStr for SendSagaState {
     type Err = Error;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
+            "prepared_acquiring" => Ok(Self::PreparedAcquiring),
+            "prepared_cancelling" => Ok(Self::PreparedCancelling),
+            "prepared_cancelled" => Ok(Self::PreparedCancelled),
+            "confirming" => Ok(SendSagaState::Confirming),
             "proofs_reserved" => Ok(SendSagaState::ProofsReserved),
             "token_created" => Ok(SendSagaState::TokenCreated),
             "rolling_back" => Ok(SendSagaState::RollingBack),
+            "reclaim_preparing" => Ok(Self::ReclaimPreparing),
+            "reclaim_cancelling" => Ok(Self::ReclaimCancelling),
+            "reclaiming" => Ok(Self::Reclaiming),
+            "reclaimed" => Ok(Self::Reclaimed),
+            "claimed" => Ok(Self::Claimed),
             _ => Err(Error::InvalidOperationState),
         }
     }
@@ -44,6 +80,15 @@ impl std::str::FromStr for SendSagaState {
 /// Operation-specific data for Send operations
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SendOperationData {
+    /// Exact reserved inputs and cancellation retention policy, saved at preparation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preparation: Option<Box<super::SendPreparation>>,
+    /// Exact reclaim owned by this send, independent of any child swap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reclaim: Option<Box<super::SendReclaim>>,
+    /// Durable pre-spend confirmation, retained until the token is saved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirmation: Option<Box<super::SendConfirmation>>,
     /// Target amount to send
     pub amount: Amount,
     /// Memo for the send
@@ -95,6 +140,9 @@ mod tests {
         );
 
         let data = SendOperationData {
+            preparation: None,
+            confirmation: None,
+            reclaim: None,
             amount: Amount::from(1),
             memo: None,
             counter_start: None,

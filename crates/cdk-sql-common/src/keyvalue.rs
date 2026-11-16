@@ -9,12 +9,52 @@ use cdk_common::database::{validate_kvstore_params, Error};
 use cdk_common::util::unix_time;
 
 use crate::column_as_string;
-#[cfg(feature = "mint")]
+#[cfg(any(feature = "mint", feature = "wallet"))]
 use crate::database::ConnectionWithTransaction;
-#[cfg(feature = "mint")]
+#[cfg(any(feature = "mint", feature = "wallet"))]
 use crate::pool::PooledResource;
 use crate::pool::{DatabasePool, Pool};
-use crate::stmt::{query, Column};
+use crate::stmt::{query, Column, Statement};
+
+#[cfg(feature = "wallet")]
+pub(crate) const COLUMNS: [&str; 6] = [
+    "primary_namespace",
+    "secondary_namespace",
+    "key",
+    "value",
+    "created_time",
+    "updated_time",
+];
+
+pub(crate) fn write_statement(
+    primary_namespace: &str,
+    secondary_namespace: &str,
+    key: &str,
+    value: &[u8],
+) -> Result<Statement, Error> {
+    // Validate parameters according to KV store requirements
+    validate_kvstore_params(primary_namespace, secondary_namespace, Some(key))?;
+
+    let current_time = unix_time();
+
+    Ok(query(
+        r#"
+        INSERT INTO kv_store
+        (primary_namespace, secondary_namespace, key, value, created_time, updated_time)
+        VALUES (:primary_namespace, :secondary_namespace, :key, :value, :created_time, :updated_time)
+        ON CONFLICT(primary_namespace, secondary_namespace, key)
+        DO UPDATE SET
+            value = excluded.value,
+            updated_time = excluded.updated_time
+        "#,
+    )?
+    .bind("primary_namespace", primary_namespace.to_owned())
+    .bind("secondary_namespace", secondary_namespace.to_owned())
+    .bind("key", key.to_owned())
+    .bind("value", value.to_vec())
+    .bind("created_time", current_time as i64)
+    .bind("updated_time", current_time as i64))
+}
 
 /// Generic implementation of KVStoreTransaction for SQL databases
 #[cfg(feature = "mint")]
@@ -61,36 +101,15 @@ pub(crate) async fn kv_write_in_transaction<RM>(
 where
     RM: DatabasePool,
 {
-    // Validate parameters according to KV store requirements
-    validate_kvstore_params(primary_namespace, secondary_namespace, Some(key))?;
-
-    let current_time = unix_time();
-
-    query(
-        r#"
-        INSERT INTO kv_store
-        (primary_namespace, secondary_namespace, key, value, created_time, updated_time)
-        VALUES (:primary_namespace, :secondary_namespace, :key, :value, :created_time, :updated_time)
-        ON CONFLICT(primary_namespace, secondary_namespace, key)
-        DO UPDATE SET
-            value = excluded.value,
-            updated_time = excluded.updated_time
-        "#,
-    )?
-    .bind("primary_namespace", primary_namespace.to_owned())
-    .bind("secondary_namespace", secondary_namespace.to_owned())
-    .bind("key", key.to_owned())
-    .bind("value", value.to_vec())
-    .bind("created_time", current_time as i64)
-    .bind("updated_time", current_time as i64)
-    .execute(conn)
-    .await?;
+    write_statement(primary_namespace, secondary_namespace, key, value)?
+        .execute(conn)
+        .await?;
 
     Ok(())
 }
 
 /// Generic implementation of kv_write_if_absent for transactions
-#[cfg(feature = "mint")]
+#[cfg(any(feature = "mint", feature = "wallet"))]
 pub(crate) async fn kv_write_if_absent_in_transaction<RM>(
     conn: &ConnectionWithTransaction<RM::Connection, PooledResource<RM>>,
     primary_namespace: &str,
@@ -157,7 +176,7 @@ where
 }
 
 /// Generic implementation of kv_write_if_equals for transactions
-#[cfg(feature = "mint")]
+#[cfg(any(feature = "mint", feature = "wallet"))]
 pub(crate) async fn kv_write_if_equals_in_transaction<RM>(
     conn: &ConnectionWithTransaction<RM::Connection, PooledResource<RM>>,
     primary_namespace: &str,
@@ -370,30 +389,9 @@ pub(crate) async fn kv_write_standalone<C>(
 where
     C: crate::database::DatabaseExecutor,
 {
-    // Validate parameters according to KV store requirements
-    validate_kvstore_params(primary_namespace, secondary_namespace, Some(key))?;
-
-    let current_time = unix_time();
-
-    query(
-        r#"
-        INSERT INTO kv_store
-        (primary_namespace, secondary_namespace, key, value, created_time, updated_time)
-        VALUES (:primary_namespace, :secondary_namespace, :key, :value, :created_time, :updated_time)
-        ON CONFLICT(primary_namespace, secondary_namespace, key)
-        DO UPDATE SET
-            value = excluded.value,
-            updated_time = excluded.updated_time
-        "#,
-    )?
-    .bind("primary_namespace", primary_namespace.to_owned())
-    .bind("secondary_namespace", secondary_namespace.to_owned())
-    .bind("key", key.to_owned())
-    .bind("value", value.to_vec())
-    .bind("created_time", current_time as i64)
-    .bind("updated_time", current_time as i64)
-    .execute(conn)
-    .await?;
+    write_statement(primary_namespace, secondary_namespace, key, value)?
+        .execute(conn)
+        .await?;
 
     Ok(())
 }

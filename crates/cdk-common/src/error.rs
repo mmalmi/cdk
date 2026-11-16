@@ -314,6 +314,26 @@ pub enum Error {
         /// Maximum allowed outputs
         max: usize,
     },
+    /// Retained mint metadata exceeds the wallet's configured resource budget.
+    #[error("Mint metadata exceeds budget: {keysets}/{max_keysets} keysets, at least {bytes}/{max_bytes} bytes")]
+    MintMetadataTooLarge {
+        /// Distinct keysets observed before refusal.
+        keysets: usize,
+        /// Serialized bytes observed before refusal; zero when count rejects first.
+        bytes: u64,
+        /// Maximum retained keyset identities.
+        max_keysets: u32,
+        /// Maximum retained serialized bytes.
+        max_bytes: u32,
+    },
+    /// The wallet repository exceeds its configured entry limit.
+    #[error("Wallet repository exceeds configured entry limit: {wallets} wallets, maximum {max_wallets}")]
+    WalletRepositoryTooLarge {
+        /// Wallet entries observed before refusal.
+        wallets: u64,
+        /// Maximum wallet entries retained by the repository.
+        max_wallets: u32,
+    },
     /// Duplicate quote IDs provided in a batch request (NUT-29)
     #[error("Duplicate quote IDs")]
     DuplicateQuoteIds,
@@ -390,6 +410,14 @@ pub enum Error {
     /// Max Fee Ecxeded
     #[error("Max fee exceeded")]
     MaxFeeExceeded,
+    /// A prepared send would debit more than the caller authorized.
+    #[error("Wallet debit {amount} exceeds maximum {maximum}")]
+    MaxAmountExceeded {
+        /// Required wallet debit.
+        amount: Amount,
+        /// Authorized maximum debit.
+        maximum: Amount,
+    },
     /// Invalid NUT-13 restore options
     #[error("Invalid NUT-13 restore options: `{field}` {reason}")]
     InvalidNut13Options {
@@ -458,6 +486,9 @@ pub enum Error {
     /// Invalid transaction status
     #[error("Invalid transaction status")]
     InvalidTransactionStatus,
+    /// Invalid transaction role or refund receipt shape
+    #[error("Invalid transaction role or refund receipt shape")]
+    InvalidTransactionRole,
     /// Invalid transaction id
     #[error("Invalid transaction id")]
     InvalidTransactionId,
@@ -736,6 +767,7 @@ impl Error {
             | Self::DuplicateOutputs
             | Self::MaxInputsExceeded { .. }
             | Self::MaxOutputsExceeded { .. }
+            | Self::RequestFieldTooLarge { .. }
             | Self::DuplicateQuoteIds
             | Self::BatchSizeExceeded { .. }
             | Self::MultipleUnits
@@ -747,6 +779,7 @@ impl Error {
             | Self::InvalidSpendConditions(_)
             | Self::IncorrectWallet(_)
             | Self::MaxFeeExceeded
+            | Self::MaxAmountExceeded { .. }
             | Self::InvalidNut13Options { .. }
             | Self::DleqProofNotProvided
             | Self::IncorrectMint
@@ -759,6 +792,7 @@ impl Error {
             | Self::InvoiceDescriptionUnsupported
             | Self::InvalidTransactionDirection
             | Self::InvalidTransactionStatus
+            | Self::InvalidTransactionRole
             | Self::InvalidTransactionId
             | Self::InvalidOperationKind
             | Self::InvalidOperationState
@@ -790,6 +824,8 @@ impl Error {
             | Self::PendingQuote
             | Self::TokenPending
             | Self::CouldNotGetMintInfo
+            | Self::MintMetadataTooLarge { .. }
+            | Self::WalletRepositoryTooLarge { .. }
             | Self::UnknownErrorResponse(_)
             | Self::InvalidMintResponse(_)
             | Self::ConcurrentUpdate

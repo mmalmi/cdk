@@ -1,91 +1,69 @@
-//! Send Saga - Type State Pattern Implementation
+//! Durable send preparation, delivery and reclaim.
 //!
-//! This module implements the saga pattern for send operations using the typestate
-//! pattern to enforce valid state transitions at compile-time.
+//! Preparation saves its exact reserved inputs. Cancellation fences confirmation
+//! before releasing them and optionally retains its zero-spend outcome for the
+//! caller to acknowledge. Confirmation persists the exact mint request
+//! before spending them and atomically publishes a pending send receipt with
+//! the deliverable token. Recovery reuses the saved request and output secrets.
 //!
-//! # State Flow
+//! A token remains pending until the recipient spends it or reclaim completes.
+//! Recipient completion first fences the send in `Claimed`. Reclaim persists an
+//! exact replacement request in `ReclaimPreparing`, acquires its inputs before
+//! entering `Reclaiming`, then commits its verified coins and publishes a
+//! distinct refund receipt in `Reclaimed`. Both paths finish the
+//! original send receipt before removing the saga.
 //!
-//! ```text
-//!                                  Normal Flow
-//!                                  ===========
-//!
-//! [saga created] ──► ProofsReserved ──► TokenCreated ──► [recipient claims] ──► [completed]
-//!                                            │
-//!                                            └──► [user revokes]
-//!                                                       │
-//!                                                       ├─ proofs already spent ──► [completed] + error
-//!                                                       │
-//!                                                       └─ proofs not spent
-//!                                                                 │
-//!                                                                 ▼
-//!                                                           RollingBack
-//!                                                                 │
-//!                                                       ┌─────────┴─────────┐
-//!                                                       │                   │
-//!                                                  swap succeeds       swap fails
-//!                                                       │                   │
-//!                                                       ▼                   ▼
-//!                                                  [completed]        TokenCreated
-//!                                                (proofs reclaimed)   (revert, retry)
-//!
-//!
-//!                                  Recovery Flow
-//!                                  =============
-//!
-//! ProofsReserved ─────────────────────────────────────────► [compensated]
-//!
-//! TokenCreated
-//!     ├─ proofs spent ────────► [completed] (recipient claimed)
-//!     ├─ proofs not spent ────► [completed] (saga deleted, token still valid)
-//!     └─ mint unreachable ────► [skipped]
-//!
-//! RollingBack
-//!     ├─ proofs spent ────────► [completed] (revoke swap succeeded)
-//!     ├─ proofs not spent ────► TokenCreated (revert state, keep monitoring)
-//!     └─ mint unreachable ────► [skipped]
-//! ```
-//!
-//! # States
-//!
-//! | State | Description |
-//! |-------|-------------|
-//! | `ProofsReserved` | Proofs selected and reserved for sending, ready to create token |
-//! | `TokenCreated` | Token created and ready to share, proofs marked as pending spent awaiting claim |
-//! | `RollingBack` | Rollback in progress, reclaiming proofs via swap (transient state) |
-//!
-//! # Recovery Outcomes
-//!
-//! | Outcome | Description |
-//! |---------|-------------|
-//! | `[completed]` | Send finalized - either recipient claimed, or user successfully revoked |
-//! | `[compensated]` | Send cancelled before token created, reserved proofs released |
-//! | `[skipped]` | Recovery deferred (mint unreachable), will retry on next recovery |
+//! Mint errors and partial results retain recovery state. Proof handoffs and
+//! receipt publication require the exact active saga, so stale workers cannot
+//! revive coins, overwrite a terminal receipt or recreate retired history.
 
 use std::collections::{HashMap, HashSet};
 
 use bitcoin::XOnlyPublicKey;
 use cdk_common::amount::KeysetFeeAndAmounts;
-use cdk_common::util::unix_time;
 use cdk_common::wallet::{
-    KeysetLoadPolicy, OperationData, P2PKLockedProofSendMode, SendOperationData, SendSagaState,
-    Transaction, TransactionDirection, TransactionStatus, WalletSaga, WalletSagaState,
+    KeysetLoadPolicy, OperationData, P2PKLockedProofSendMode, SendSagaState, WalletSaga,
+    WalletSagaState,
 };
 use cdk_common::Id;
 use tracing::instrument;
 
 use self::state::{Initial, Prepared, TokenCreated};
-use super::{split_proofs_for_send, SendMemo, SendOptions};
-use crate::amount::SplitTarget;
+use super::{amounts, split_proofs_for_send, SendMemo, SendOptions};
 use crate::fees::calculate_fee;
 use crate::nuts::nut00::ProofsMethods;
 use crate::nuts::nut11::{enforce_sig_flag, SigFlag};
 use crate::nuts::{Proof, Proofs, State, Token};
-use crate::wallet::saga::{
-    add_compensation, execute_compensations, new_compensations, Compensations,
-    RevertProofReservation,
-};
 use crate::wallet::SendKind;
 use crate::{Amount, Error, Wallet};
+
+pub(crate) mod cancellation;
+pub(crate) mod claim;
+mod confirmation;
+#[cfg(test)]
+mod confirmation_tests;
+mod constraints;
+mod custody;
+#[cfg(test)]
+mod custody_tests;
+mod fee_plan;
+mod handoff;
+#[cfg(test)]
+pub(crate) mod interposed_store;
+mod preparation;
+#[cfg(test)]
+mod prepared_acquire_tests;
+#[cfg(test)]
+mod prepared_cancel_tests;
+pub(crate) mod reclaim;
+#[cfg(test)]
+mod targeted_recovery_tests;
+mod terminal;
+
+#[cfg(test)]
+mod fee_tests;
+#[cfg(test)]
+mod funding_tests;
 
 pub(crate) mod resume;
 pub(crate) mod state;
@@ -168,7 +146,7 @@ async fn merge_keyring_keys(
 }
 
 struct SendSplitContext<'a> {
-    send_amounts: &'a [Amount],
+    send_amounts: &'a [(Amount, u64)],
     amount: Amount,
     send_fee: Amount,
     keyset_fees: &'a HashMap<Id, u64>,
@@ -181,7 +159,7 @@ struct InputFeeCoverageContext<'a> {
     send_fee: Amount,
     active_keyset_ids: &'a Vec<Id>,
     keyset_fees: &'a KeysetFeeAndAmounts,
-    send_amounts: &'a [Amount],
+    send_amounts: &'a [(Amount, u64)],
     force_swap: bool,
     is_exact_or_offline: bool,
     derivation_indices: &'a HashMap<Proof, u32>,
@@ -275,18 +253,9 @@ fn split_proofs_for_send_respecting_p2pk_locks(
         } else if context.is_exact_or_offline {
             proofs_to_send = rest;
         } else {
-            let mut remaining_send_amounts: Vec<Amount> = context.send_amounts.to_vec();
-            for proof in rest {
-                if let Some(idx) = remaining_send_amounts
-                    .iter()
-                    .position(|a| a == &proof.amount)
-                {
-                    proofs_to_send.push(proof);
-                    remaining_send_amounts.remove(idx);
-                } else {
-                    proofs_to_swap.push(proof);
-                }
-            }
+            let (send, swap) = amounts::partition(rest, context.send_amounts);
+            proofs_to_send = send;
+            proofs_to_swap.extend(swap);
 
             if !proofs_to_swap.is_empty() {
                 let swap_output_needed = (context.amount + context.send_fee)
@@ -365,8 +334,6 @@ fn selected_proofs_net_after_swap_fees(
 pub(crate) struct SendSaga<'a, S> {
     /// Wallet reference
     pub(crate) wallet: &'a Wallet,
-    /// Compensating actions in LIFO order (most recent first)
-    pub(crate) compensations: Compensations,
     /// State-specific data
     pub(crate) state_data: S,
 }
@@ -378,7 +345,6 @@ impl<'a> SendSaga<'a, Initial> {
 
         Self {
             wallet,
-            compensations: new_compensations(),
             state_data: Initial {
                 operation_id,
                 keyset_policy: Default::default(),
@@ -397,7 +363,7 @@ impl<'a> SendSaga<'a, Initial> {
     /// Refreshes keysets (if online), selects and reserves proofs for the
     /// requested amount, and splits proofs between direct send and swap.
     ///
-    /// Registers compensation to revert proof reservation on failure.
+    /// Persists the original inputs and caller metadata for cancellation recovery.
     #[instrument(skip_all)]
     pub async fn prepare(
         self,
@@ -410,6 +376,8 @@ impl<'a> SendSaga<'a, Initial> {
             self.state_data.operation_id
         );
 
+        custody::validate_send_metadata(&opts.metadata)?;
+        self.wallet.ensure_send_storage(None).await?;
         let keyset_policy = self.state_data.keyset_policy;
 
         let all_keysets = self.wallet.keysets(keyset_policy).await?;
@@ -444,18 +412,19 @@ impl<'a> SendSaga<'a, Initial> {
             .ok_or(Error::NoActiveKeyset)?;
 
         let active_keyset_id = active_keyset.id;
+        constraints::check_keyset(&opts, active_keyset_id)?;
         let fee_and_amounts = keyset_fees
             .get(&active_keyset_id)
             .cloned()
             .ok_or(Error::UnknownKeySet)?;
 
-        let mut available_proofs = self
-            .wallet
-            .get_proofs_with(
-                Some(vec![State::Unspent]),
-                opts.conditions.clone().map(|c| vec![c]),
-            )
-            .await?;
+        let inventory = self.wallet.unspent_inventory().await?;
+        let conditions = opts.conditions.clone().map(|condition| vec![condition]);
+        let mut available_proofs: Proofs = inventory
+            .iter()
+            .filter(|row| row.matches_conditions(&None, &None, &None, &conditions))
+            .map(|row| row.proof.clone())
+            .collect();
 
         // When passthrough is not opted in, exclude P2PK-locked proofs for which the wallet
         // holds no signing key (neither explicit nor in the keyring). Without a key, such proofs
@@ -472,6 +441,11 @@ impl<'a> SendSaga<'a, Initial> {
         }
 
         let mut force_swap = false;
+        if opts.send_kind.is_offline() {
+            if let Some(id) = opts.required_keyset_id {
+                available_proofs.retain(|proof| proof.keyset_id == id);
+            }
+        }
         let available_sum = available_proofs.total_amount()?;
         if available_sum < amount {
             if opts.conditions.is_none() || opts.send_kind.is_offline() {
@@ -479,18 +453,10 @@ impl<'a> SendSaga<'a, Initial> {
             } else {
                 tracing::debug!("Insufficient proofs matching conditions");
                 force_swap = true;
-                available_proofs = self
-                    .wallet
-                    .localstore
-                    .get_proofs(
-                        Some(self.wallet.mint_url.clone()),
-                        Some(self.wallet.unit.clone()),
-                        Some(vec![State::Unspent]),
-                        Some(vec![]),
-                    )
-                    .await?
-                    .into_iter()
-                    .map(|p| p.proof)
+                available_proofs = inventory
+                    .iter()
+                    .filter(|row| row.spending_condition.is_none())
+                    .map(|row| row.proof.clone())
                     .collect();
 
                 if opts.p2pk_locked_proof_send_mode == P2PKLockedProofSendMode::Swap {
@@ -504,20 +470,8 @@ impl<'a> SendSaga<'a, Initial> {
             }
         }
 
-        let send_amounts = if opts.include_fee {
-            let send_split = amount.split_with_fee(&fee_and_amounts)?;
-            let send_fee = self
-                .wallet
-                .get_proofs_fee_by_count(
-                    vec![(active_keyset_id, send_split.len() as u64)]
-                        .into_iter()
-                        .collect(),
-                )
-                .await?;
-            (send_split, send_fee.total)
-        } else {
-            (amount.split(&fee_and_amounts)?, Amount::ZERO)
-        };
+        let send_amounts =
+            fee_plan::amounts_and_reserve(amount, opts.include_fee, &fee_and_amounts)?;
         let selection_amount = amount + send_amounts.1;
 
         let may_swap_p2pk_locked = opts.p2pk_locked_proof_send_mode
@@ -526,16 +480,57 @@ impl<'a> SendSaga<'a, Initial> {
                 .iter()
                 .any(crate::wallet::util::is_p2pk_locked);
 
+        let derivation_indices = Wallet::proof_derivation_indices(&inventory);
+        drop(inventory);
+        // An existing exact net payment needs neither a swap nor its input fee.
+        if (opts.include_fee || opts.required_keyset_id.is_some())
+            && !force_swap
+            && !may_swap_p2pk_locked
+        {
+            let direct_pool = available_proofs
+                .iter()
+                .filter(|p| opts.required_keyset_id.is_none_or(|id| p.keyset_id == id))
+                .cloned()
+                .collect();
+            let direct = match Wallet::select_proofs_with_derivation_indices(
+                amount,
+                direct_pool,
+                &active_keyset_ids,
+                &keyset_fees,
+                opts.include_fee,
+                &derivation_indices,
+            ) {
+                Ok(proofs) => proofs,
+                Err(Error::InsufficientFunds) => Vec::new(),
+                Err(error) => return Err(error),
+            };
+            let fee = if opts.include_fee {
+                self.wallet.get_proofs_fee(&direct).await?.total
+            } else {
+                Amount::ZERO
+            };
+            if fee_plan::can_send_direct(amount, selection_amount, &direct, fee, &opts)? {
+                return self
+                    .internal_prepare(amount, opts, direct, false, keyset_policy)
+                    .await;
+            }
+            if opts.send_kind.is_offline() {
+                return Err(Error::InsufficientFunds);
+            }
+        }
+
         let proof_pool = available_proofs.clone();
-        let derivation_indices = self.wallet.unspent_proof_derivation_indices().await?;
+        let may_convert_keyset = !constraints::matching_proofs(&opts, &available_proofs);
         let mut selected_proofs = Wallet::select_proofs_with_derivation_indices(
             selection_amount,
             available_proofs,
             &active_keyset_ids,
             &keyset_fees,
-            opts.include_fee || force_swap,
+            opts.include_fee || force_swap || may_convert_keyset,
             &derivation_indices,
         )?;
+
+        force_swap |= !constraints::matching_proofs(&opts, &selected_proofs);
 
         let send_fee = if opts.include_fee {
             self.wallet.get_proofs_fee(&selected_proofs).await?.total
@@ -543,7 +538,7 @@ impl<'a> SendSaga<'a, Initial> {
             Amount::ZERO
         };
 
-        if may_swap_p2pk_locked {
+        if may_swap_p2pk_locked || force_swap {
             let is_exact_or_offline = selected_proofs.total_amount()? == amount + send_fee
                 || opts.send_kind.is_offline()
                 || opts.send_kind.has_tolerance();
@@ -589,7 +584,7 @@ impl<'a> SendSaga<'a, Initial> {
     }
 
     async fn internal_prepare(
-        mut self,
+        self,
         amount: Amount,
         opts: SendOptions,
         proofs: Proofs,
@@ -601,6 +596,11 @@ impl<'a> SendSaga<'a, Initial> {
             .active_keyset_with_policy(keyset_policy)
             .await?
             .id;
+        constraints::check_keyset(&opts, active_keyset_id)?;
+        let force_swap = force_swap || !constraints::matching_proofs(&opts, &proofs);
+        if force_swap && opts.send_kind.is_offline() {
+            return Err(Error::InsufficientFunds);
+        }
         let fee_and_amounts = self
             .wallet
             .get_keyset_fees_and_amounts_with_policy(keyset_policy)
@@ -609,33 +609,18 @@ impl<'a> SendSaga<'a, Initial> {
             .cloned()
             .ok_or(Error::UnknownKeySet)?;
 
-        let (send_amounts, send_fee) = if opts.include_fee {
-            let send_split = amount.split_with_fee(&fee_and_amounts)?;
-            let send_fee = self
-                .wallet
-                .get_proofs_fee_by_count(
-                    vec![(active_keyset_id, send_split.len() as u64)]
-                        .into_iter()
-                        .collect(),
-                )
-                .await?;
-            (send_split, send_fee)
+        let (send_amounts, mut send_fee) =
+            fee_plan::amounts_and_reserve(amount, opts.include_fee, &fee_and_amounts)?;
+        let actual_fee = if opts.include_fee {
+            self.wallet.get_proofs_fee(&proofs).await?.total
         } else {
-            let send_split = amount.split(&fee_and_amounts)?;
-            let send_fee = crate::fees::ProofsFeeBreakdown {
-                total: Amount::ZERO,
-                per_keyset: std::collections::HashMap::new(),
-            };
-            (send_split, send_fee)
+            Amount::ZERO
         };
-
-        let mut exact_proofs = proofs.total_amount()? == amount + send_fee.total;
-        if let Some(max_proofs) = opts.max_proofs {
-            exact_proofs &= proofs.len() <= max_proofs;
-        }
-
         let is_exact_or_offline =
-            exact_proofs || opts.send_kind.is_offline() || opts.send_kind.has_tolerance();
+            fee_plan::can_send_direct(amount, amount + send_fee, &proofs, actual_fee, &opts)?;
+        if opts.send_kind.is_offline() && !is_exact_or_offline {
+            return Err(Error::InsufficientFunds);
+        }
 
         let keyset_fees_and_amounts = self
             .wallet
@@ -652,53 +637,72 @@ impl<'a> SendSaga<'a, Initial> {
             SendSplitContext {
                 send_amounts: &send_amounts,
                 amount,
-                send_fee: send_fee.total,
+                send_fee,
                 keyset_fees: &keyset_fees,
                 force_swap,
                 is_exact_or_offline,
             },
         )?;
 
-        let mut proof_ys = split_result.proofs_to_swap.ys()?;
-        proof_ys.extend(split_result.proofs_to_send.ys()?);
-
-        self.wallet
-            .localstore
-            .reserve_proofs(proof_ys.clone(), &self.state_data.operation_id)
-            .await?;
-
-        let memo_text = opts.memo.as_ref().map(|m| m.memo.clone());
-        let saga = WalletSaga::new(
-            self.state_data.operation_id,
-            WalletSagaState::Send(SendSagaState::ProofsReserved),
-            amount,
-            self.wallet.mint_url.clone(),
-            self.wallet.unit.clone(),
-            OperationData::Send(SendOperationData {
+        let split_result = if opts.include_fee {
+            let (split, reserve) = fee_plan::complete_plan(
                 amount,
-                memo: memo_text.clone(),
-                counter_start: None,
-                counter_end: None,
-                token: None,
-                proofs: None,
-            }),
-        );
+                amount.checked_add(send_fee).ok_or(Error::AmountOverflow)?,
+                split_result,
+                active_keyset_id,
+                &keyset_fees,
+                &fee_and_amounts,
+            )?;
+            send_fee = reserve;
+            split
+        } else {
+            split_result
+        };
 
-        self.wallet.localstore.add_saga(saga.clone()).await?;
-
-        add_compensation(
-            &mut self.compensations,
-            Box::new(RevertProofReservation {
-                localstore: self.wallet.localstore.clone(),
-                proof_ys,
-                saga_id: self.state_data.operation_id,
-            }),
+        if opts.max_proofs.is_some() {
+            let outputs = if split_result.proofs_to_swap.is_empty() {
+                0
+            } else {
+                fee_plan::output_count(
+                    amount
+                        .checked_add(send_fee)
+                        .ok_or(Error::AmountOverflow)?
+                        .checked_sub(split_result.proofs_to_send.total_amount()?)
+                        .unwrap_or(Amount::ZERO),
+                    &fee_and_amounts,
+                )?
+            };
+            constraints::check_proof_count(&opts, split_result.proofs_to_send.len(), outputs)?;
+        }
+        constraints::check_debit(
+            &opts,
+            amount,
+            send_fee,
+            split_result.swap_fee,
+            &split_result.proofs_to_send,
+            !split_result.proofs_to_swap.is_empty(),
+        )?;
+        constraints::check_input_bytes(
+            &opts,
+            split_result
+                .proofs_to_swap
+                .iter()
+                .chain(&split_result.proofs_to_send),
+        )?;
+        let saga = preparation::acquire(
+            self.wallet,
+            self.state_data.operation_id,
+            amount,
+            &opts,
+            split_result
+                .proofs_to_swap
+                .iter()
+                .chain(&split_result.proofs_to_send),
         )
-        .await;
+        .await?;
 
         Ok(SendSaga {
             wallet: self.wallet,
-            compensations: self.compensations,
             state_data: Prepared {
                 operation_id: self.state_data.operation_id,
                 amount,
@@ -706,7 +710,7 @@ impl<'a> SendSaga<'a, Initial> {
                 proofs_to_swap: split_result.proofs_to_swap,
                 swap_fee: split_result.swap_fee,
                 proofs_to_send: split_result.proofs_to_send,
-                send_fee: send_fee.total,
+                send_fee,
                 saga,
             },
         })
@@ -742,9 +746,18 @@ impl<'a> SendSaga<'a, Prepared> {
             ));
         }
 
+        let original = cancellation::validate(
+            wallet,
+            &saga,
+            amount,
+            proofs_to_swap.iter().chain(&proofs_to_send),
+        )?;
+        if original.metadata != options.metadata {
+            return Err(Error::InvalidOperationState);
+        }
+
         Ok(Self {
             wallet,
-            compensations: new_compensations(),
             state_data: Prepared {
                 operation_id,
                 amount,
@@ -799,7 +812,7 @@ impl<'a> SendSaga<'a, Prepared> {
     /// token, and persists the saga in TokenCreated state.
     #[instrument(skip(self), err)]
     pub async fn confirm(
-        mut self,
+        self,
         memo: Option<SendMemo>,
     ) -> Result<(Token, SendSaga<'a, TokenCreated>), Error> {
         let operation_id = self.state_data.operation_id;
@@ -812,14 +825,34 @@ impl<'a> SendSaga<'a, Prepared> {
 
         tracing::info!("Confirming prepared send for operation {}", operation_id);
 
+        let mut confirming = false;
         let logic_res = async {
-            let total_send_fee = swap_fee + send_fee;
+            custody::validate_send_metadata(&options.metadata)?;
+            constraints::check_input_bytes(&options, proofs_to_swap.iter().chain(&proofs_to_send))?;
+            self.wallet
+                .ensure_send_storage(Some(&self.state_data.saga))
+                .await?;
+            constraints::check_debit(
+                &options,
+                amount,
+                send_fee,
+                swap_fee,
+                &proofs_to_send,
+                !proofs_to_swap.is_empty(),
+            )?;
+            if !constraints::matching_proofs(&options, &proofs_to_send) {
+                return Err(Error::InactiveKeyset);
+            }
+            constraints::check_proof_count(&options, proofs_to_send.len(), 0)?;
             let mut final_proofs_to_send = proofs_to_send.clone();
 
             let total_send_amount = amount + send_fee;
 
             let mut counter_start = None;
             let mut counter_end = None;
+            let mut pre_swap = None;
+            let mut proposal = None;
+            let mut swap_amount = Amount::ZERO;
 
             // When locked-proof passthrough is opted in, sign proofs that bypass the swap
             // before including them in the token. Signing is not optional: an unsigned
@@ -853,8 +886,7 @@ impl<'a> SendSaga<'a, Prepared> {
                 if options.send_kind.is_offline() {
                     return Err(Error::InsufficientFunds);
                 }
-
-                let swap_amount = total_send_amount
+                swap_amount = total_send_amount
                     .checked_sub(final_proofs_to_send.total_amount()?)
                     .unwrap_or(Amount::ZERO);
 
@@ -868,96 +900,96 @@ impl<'a> SendSaga<'a, Prepared> {
                 }
 
                 let keyset_id = self.wallet.active_keyset().await?.id;
+                constraints::check_keyset(&options, keyset_id)?;
 
-                // Capture counter start before swap
-                counter_start = Some(
-                    self.wallet
-                        .localstore
-                        .increment_keyset_counter(&keyset_id, 0)
-                        .await?,
-                );
-
-                if let Some(swapped_proofs) = self
-                    .wallet
-                    .swap_no_reserve(
-                        Some(swap_amount),
-                        SplitTarget::None,
-                        proofs_to_swap,
-                        options.conditions.clone(),
-                        false,
-                        options.use_p2bk,
-                    )
-                    .await?
-                {
-                    final_proofs_to_send.extend(swapped_proofs);
+                // Recheck the preview before spending inputs: a rotation or fee
+                // change must not silently exceed the prepared reserve.
+                if self.wallet.get_proofs_fee(&proofs_to_swap).await?.total > swap_fee {
+                    return Err(Error::MaxFeeExceeded);
+                }
+                if options.include_fee || options.max_proofs.is_some() {
+                    let keyset = self
+                        .wallet
+                        .get_keyset_fees_and_amounts_with_policy(KeysetLoadPolicy::CacheOnly)
+                        .await?
+                        .get(&keyset_id)
+                        .cloned()
+                        .ok_or(Error::UnknownKeySet)?;
+                    let outputs = fee_plan::output_count(swap_amount, &keyset)?;
+                    constraints::check_proof_count(&options, final_proofs_to_send.len(), outputs)?;
+                    if options.include_fee {
+                        let mut counts = final_proofs_to_send.count_by_keyset();
+                        let count = counts.entry(keyset_id).or_default();
+                        *count = count
+                            .checked_add(outputs as u64)
+                            .ok_or(Error::AmountOverflow)?;
+                        if self.wallet.get_proofs_fee_by_count(counts).await?.total > send_fee {
+                            return Err(Error::MaxFeeExceeded);
+                        }
+                    }
                 }
 
-                // Capture counter end after swap
-                counter_end = Some(
-                    self.wallet
-                        .localstore
-                        .increment_keyset_counter(&keyset_id, 0)
-                        .await?,
-                );
+                let (prepared, starting_counter) = constraints::prepare_swap(
+                    self.wallet,
+                    swap_amount,
+                    proofs_to_swap,
+                    &options,
+                    keyset_id,
+                    swap_fee,
+                )
+                .await?;
+                proposal = Some((keyset_id, starting_counter));
+                // Save only this private proposal's range; the atomic commit
+                // below checks that another operation has not consumed it.
+                let indices = prepared
+                    .pre_mint_secrets
+                    .secrets
+                    .iter()
+                    .filter_map(|s| s.derivation_index);
+                counter_start = indices.clone().min();
+                counter_end = indices
+                    .max()
+                    .map(|i| i.checked_add(1).ok_or(Error::AmountOverflow))
+                    .transpose()?;
+                pre_swap = Some(prepared);
             }
 
-            if amount > final_proofs_to_send.total_amount()? {
-                return Err(Error::InsufficientFunds);
-            }
-
-            self.wallet
-                .localstore
-                .update_proofs_state(final_proofs_to_send.ys()?, State::PendingSpent)
-                .await?;
-
-            let send_memo = options.memo.clone().or(memo);
-            let token_memo =
-                send_memo.and_then(|m| if m.include_memo { Some(m.memo) } else { None });
-
-            self.wallet
-                .localstore
-                .add_transaction(Transaction {
-                    mint_url: self.wallet.mint_url.clone(),
-                    direction: TransactionDirection::Outgoing,
-                    amount,
-                    fee: total_send_fee,
-                    unit: self.wallet.unit.clone(),
-                    ys: final_proofs_to_send.ys()?,
-                    timestamp: unix_time(),
-                    memo: token_memo.clone(),
-                    metadata: options.metadata.clone(),
-                    quote_id: None,
-                    payment_request: None,
-                    payment_proof: None,
-                    payment_method: None,
-                    saga_id: Some(operation_id),
-                    status: TransactionStatus::Pending,
-                })
-                .await?;
-
-            let token = Token::new(
-                self.wallet.mint_url.clone(),
-                final_proofs_to_send.clone(),
+            let token_memo = options
+                .memo
+                .clone()
+                .or(memo)
+                .and_then(|m| m.include_memo.then_some(m.memo));
+            let confirmation = cdk_common::wallet::SendConfirmation {
+                pre_swap,
+                swap_amount,
+                spending_conditions: options.conditions.clone(),
+                retained_proofs: final_proofs_to_send,
+                send_fee,
+                include_fee: options.include_fee,
+                max_total_amount: options.max_total_amount,
+                required_keyset_id: options.required_keyset_id,
                 token_memo,
-                self.wallet.unit.clone(),
-            );
-
+                metadata: options.metadata.clone(),
+                ready: None,
+            };
             let mut saga = self.state_data.saga.clone();
-            saga.data = OperationData::Send(SendOperationData {
-                amount,
-                memo: options.memo.as_ref().map(|m| m.memo.clone()),
-                counter_start,
-                counter_end,
-                token: Some(token.to_string()),
-                proofs: Some(final_proofs_to_send.clone()),
-            });
-            saga.update_state(WalletSagaState::Send(SendSagaState::TokenCreated));
-
-            if !self.wallet.localstore.update_saga(saga.clone()).await? {
-                return Err(Error::ConcurrentUpdate);
+            let OperationData::Send(ref mut data) = saga.data else {
+                return Err(Error::Custom("Invalid prepared send data".to_string()));
+            };
+            data.counter_start = counter_start;
+            data.counter_end = counter_end;
+            data.preparation = None;
+            data.confirmation = Some(Box::new(confirmation));
+            if saga.version == u32::MAX {
+                return Err(Error::InvalidOperationState);
             }
-
-            Ok((token, final_proofs_to_send, saga))
+            saga.update_state(WalletSagaState::Send(SendSagaState::Confirming));
+            confirmation::save_preparation(self.wallet, &self.state_data.saga, &saga, proposal)
+                .await?;
+            // From this point an error cannot prove that the mint kept the
+            // inputs unspent. Recovery owns the same immutable request.
+            confirming = true;
+            self.wallet.complete_send_confirmation(saga, false).await
         }
         .await;
 
@@ -965,7 +997,6 @@ impl<'a> SendSaga<'a, Prepared> {
             Ok((token, final_proofs_to_send, saga)) => {
                 let send_saga = SendSaga {
                     wallet: self.wallet,
-                    compensations: self.compensations,
                     state_data: TokenCreated {
                         operation_id,
                         proofs: final_proofs_to_send,
@@ -976,181 +1007,56 @@ impl<'a> SendSaga<'a, Prepared> {
                 Ok((token, send_saga))
             }
             Err(e) => {
-                if e.is_definitive_failure() {
-                    tracing::warn!(
-                        "Send saga confirmation failed (definitive): {}. Running compensations.",
-                        e
-                    );
-                    self.wallet.mark_transaction_failed(operation_id).await?;
-                    execute_compensations(&mut self.compensations).await?;
+                if !confirming {
+                    // Cancellation compares the original preparation version. If
+                    // an uncertain write committed confirmation, that fence keeps
+                    // its inputs reserved; otherwise local failures can release them.
+                    if let Err(cleanup) =
+                        cancellation::complete(self.wallet, self.state_data.saga).await
+                    {
+                        tracing::warn!("Prepared send cancellation deferred: {}", cleanup);
+                    }
                 }
                 Err(e)
             }
         }
     }
 
-    /// Cancel the prepared send and release reserved proofs
+    /// Exercise cancellation with an already loaded preparation snapshot.
+    #[cfg(test)]
     #[instrument(skip(self))]
     pub async fn cancel(self) -> Result<(), Error> {
-        let operation_id = self.state_data.operation_id;
-        tracing::info!("Cancelling prepared send for operation {}", operation_id);
-
-        let mut all_ys = self.state_data.proofs_to_swap.ys()?;
-        all_ys.extend(self.state_data.proofs_to_send.ys()?);
-
-        self.wallet
-            .localstore
-            .update_proofs_state(all_ys, State::Unspent)
-            .await?;
-
-        if let Err(e) = self.wallet.localstore.delete_saga(&operation_id).await {
-            tracing::warn!(
-                "Failed to delete send saga {}: {}. Will be cleaned up on recovery.",
-                operation_id,
-                e
-            );
-        }
-
-        Ok(())
+        cancellation::complete(self.wallet, self.state_data.saga).await
     }
 }
 
 impl<'a> SendSaga<'a, TokenCreated> {
-    /// Revoke the sent token if not yet claimed by recipient.
-    ///
-    /// Swaps proofs back to the wallet. On success, the saga is completed.
+    /// Reclaim an unclaimed token using one durable request owned by this send.
     pub async fn revoke(self) -> Result<Amount, Error> {
-        tracing::info!("Revoking send operation {}", self.state_data.operation_id);
-
-        // Check with mint if proofs are still unspent. Skip local check to force mint validation.
         let states = self
             .wallet
-            .check_proofs_spent(self.state_data.proofs.clone())
+            .check_proofs_state(self.state_data.proofs.clone())
             .await?;
-
-        if states.iter().any(|s| s.state == State::Spent) {
-            // Already spent by recipient
-            tracing::info!("Cannot revoke: token already claimed by recipient");
-            // We should finalize the saga as "Spent"
-            self.finalize(TransactionStatus::Completed).await?;
-            return Err(Error::Custom("Token already claimed".to_string()));
-        }
-
-        // Lock saga in RollingBack state to prevent proof watcher from treating swap as recipient claim
-        let operation_id = self.state_data.operation_id;
-        let mut saga = self.state_data.saga.clone();
-        saga.update_state(WalletSagaState::Send(SendSagaState::RollingBack));
-        if let OperationData::Send(ref mut data) = saga.data {
-            data.proofs = Some(self.state_data.proofs.clone());
-        }
-
-        if !self.wallet.localstore.update_saga(saga).await? {
-            return Err(Error::ConcurrentUpdate);
-        }
-
-        // Swap proofs back to wallet with fresh secrets
-        let swap_result = self
-            .wallet
-            .swap_no_reserve(
-                None, // Swap all
-                SplitTarget::default(),
-                self.state_data.proofs.clone(),
-                None,
-                false,
-                false,
-            )
-            .await;
-
-        match swap_result {
-            Ok(swapped_proofs) => {
-                let amount_recovered = match swapped_proofs {
-                    Some(proofs) => proofs.total_amount()?,
-                    None => {
-                        // All proofs kept (refreshed). Recovered amount is input minus fees.
-                        let input_amount = self.state_data.proofs.total_amount()?;
-                        let fee = self
-                            .wallet
-                            .get_proofs_fee(&self.state_data.proofs)
-                            .await?
-                            .total;
-                        input_amount.checked_sub(fee).unwrap_or(Amount::ZERO)
-                    }
-                };
-
-                self.finalize(TransactionStatus::Failed).await?;
-
-                Ok(amount_recovered)
+        if states.iter().any(|s| s.state != State::Unspent) {
+            if !states.is_empty() && states.iter().all(|s| s.state == State::Spent) {
+                claim::complete(self.wallet, self.state_data.saga).await?;
             }
-            Err(e) => {
-                tracing::error!("Revoke swap failed: {}. Reverting lock.", e);
-
-                // Revert state to TokenCreated and mark proofs as PendingSpent to resume monitoring.
-                // Fetch fresh saga from DB since earlier update succeeded.
-                let current_saga = self
-                    .wallet
-                    .localstore
-                    .get_saga(&operation_id)
-                    .await?
-                    .ok_or(Error::Custom("Saga not found during revert".to_string()))?;
-
-                let mut revert_saga = current_saga;
-                revert_saga.update_state(WalletSagaState::Send(SendSagaState::TokenCreated));
-
-                self.wallet.localstore.update_saga(revert_saga).await?;
-
-                self.wallet
-                    .localstore
-                    .update_proofs_state(self.state_data.proofs.ys()?, State::PendingSpent)
-                    .await?;
-
-                Err(e)
-            }
+            return Err(cdk_common::database::Error::ProofNotUnspent.into());
         }
+        reclaim::start(self.wallet, self.state_data.saga, self.state_data.proofs).await
     }
 
-    /// Check the status of the sent token.
-    ///
-    /// Finalizes and removes the saga if the token has been claimed.
-    /// Returns true if claimed, false if still pending.
+    /// Return true after an observed recipient claim is durably completed.
     pub async fn check_status(self) -> Result<bool, Error> {
         let states = self
             .wallet
-            .check_proofs_spent(self.state_data.proofs.clone())
+            .check_proofs_state(self.state_data.proofs.clone())
             .await?;
-
-        let all_spent = states.iter().all(|s| s.state == State::Spent);
-
+        let all_spent = !states.is_empty() && states.iter().all(|s| s.state == State::Spent);
         if all_spent {
-            tracing::info!(
-                "Token for operation {} has been claimed",
-                self.state_data.operation_id
-            );
-            self.finalize(TransactionStatus::Completed).await?;
-            Ok(true)
-        } else {
-            Ok(false)
+            claim::complete(self.wallet, self.state_data.saga).await?;
         }
-    }
-
-    /// Finalize the saga (delete from DB)
-    async fn finalize(self, status: TransactionStatus) -> Result<(), Error> {
-        self.wallet
-            .update_transaction_status_by_saga_id(self.state_data.operation_id, status)
-            .await?;
-
-        if let Err(e) = self
-            .wallet
-            .localstore
-            .delete_saga(&self.state_data.operation_id)
-            .await
-        {
-            tracing::warn!(
-                "Failed to delete completed send saga {}: {}",
-                self.state_data.operation_id,
-                e
-            );
-        }
-        Ok(())
+        Ok(all_spent)
     }
 }
 
@@ -1386,6 +1292,9 @@ mod tests {
             mint_url,
             CurrencyUnit::Sat,
             OperationData::Send(SendOperationData {
+                preparation: None,
+                confirmation: None,
+                reclaim: None,
                 amount: Amount::from(100),
                 memo: None,
                 counter_start: None,
@@ -1405,7 +1314,7 @@ mod tests {
             .await
             .expect_err("cancel_send must reject a token-created send saga");
 
-        assert!(matches!(err, crate::Error::Custom(_)));
+        assert!(matches!(err, crate::Error::InvalidOperationState));
 
         let after = db.get_proofs_by_ys(vec![proof_y]).await.unwrap();
         assert_eq!(after.len(), 1);
@@ -1421,6 +1330,18 @@ mod tests {
         let operation_id = uuid::Uuid::new_v4();
         let proof = test_proof(keyset_id, 8);
 
+        let mut reserved = cdk_common::wallet::ProofInfo::new(
+            proof.clone(),
+            mint_url.clone(),
+            State::Reserved,
+            CurrencyUnit::Sat,
+        )
+        .unwrap();
+        reserved.used_by_operation = Some(operation_id);
+        db.update_proofs(vec![reserved.clone()], vec![])
+            .await
+            .unwrap();
+
         let saga_record = WalletSaga::new(
             operation_id,
             WalletSagaState::Send(SendSagaState::ProofsReserved),
@@ -1428,6 +1349,13 @@ mod tests {
             mint_url,
             CurrencyUnit::Sat,
             OperationData::Send(SendOperationData {
+                preparation: Some(Box::new(cdk_common::wallet::SendPreparation {
+                    inputs: vec![reserved],
+                    metadata: Default::default(),
+                    retain_cancellation: false,
+                })),
+                confirmation: None,
+                reclaim: None,
                 amount: Amount::from(8),
                 memo: None,
                 counter_start: None,
@@ -1619,7 +1547,7 @@ mod tests {
         proof_pool.push(test_proof(keyset_id, 8));
         let active_keyset_ids = vec![keyset_id];
         let keyset_fees = keyset_fees_with_ppk(1000);
-        let send_amounts = vec![Amount::from(63)];
+        let send_amounts = vec![(Amount::from(63), 1)];
 
         let selected = ensure_selected_proofs_cover_input_fees(
             selected_proofs,
@@ -1654,7 +1582,7 @@ mod tests {
         ];
         let active_keyset_ids = vec![keyset_id];
         let keyset_fees = keyset_fees_with_ppk(1000);
-        let send_amounts = vec![Amount::from(63)];
+        let send_amounts = vec![(Amount::from(63), 1)];
 
         let err = ensure_selected_proofs_cover_input_fees(
             selected_proofs.clone(),
@@ -1685,7 +1613,7 @@ mod tests {
         ];
         let active_keyset_ids = vec![keyset_id];
         let keyset_fees = keyset_fees_with_ppk(1000);
-        let send_amounts = vec![Amount::from(8), Amount::from(2)];
+        let send_amounts = vec![(Amount::from(8), 1), (Amount::from(2), 1)];
 
         let selected = ensure_selected_proofs_cover_input_fees(
             selected_proofs.clone(),
@@ -1707,3 +1635,6 @@ mod tests {
         assert_eq!(selected.len(), 3);
     }
 }
+
+#[cfg(test)]
+mod enumeration_tests;

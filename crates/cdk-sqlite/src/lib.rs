@@ -14,3 +14,17 @@ pub mod wallet;
 pub use mint::MintSqliteDatabase;
 #[cfg(feature = "wallet")]
 pub use wallet::WalletSqliteDatabase;
+
+#[cfg(feature = "wallet")]
+pub use cdk_sql_common::wallet::WalletKvChange;
+
+#[cfg(feature = "wallet")]
+pub use cdk_sql_common::wallet::ProofOperationOwners;
+
+#[cfg(feature = "wallet")]
+pub use cdk_sql_common::wallet::TransactionProofReferences;
+
+#[cfg(feature = "wallet")]
+pub use cdk_sql_common::wallet::storage_capacity::{
+    WalletStorageCapacity, WalletStorageClaim, WalletStorageReservation,
+};

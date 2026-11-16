@@ -42,8 +42,6 @@ pub struct Prepared {
     pub options: ReceiveOptions,
     /// Memo from the token (if any)
     pub memo: Option<String>,
-    /// Token string (if any)
-    pub token: Option<String>,
     /// Proofs extracted from the token (potentially signed for P2PK/HTLC)
     pub proofs: Proofs,
     /// Total amount of the incoming proofs
@@ -60,7 +58,6 @@ impl fmt::Debug for Prepared {
             .field("operation_id", &self.operation_id)
             .field("options", &self.options)
             .field("memo", &self.memo)
-            .field("token", &self.token.as_ref().map(|_| "[redacted]"))
             .field(
                 "proof_amounts",
                 &self
@@ -97,7 +94,6 @@ mod tests {
     use crate::Amount;
 
     const SECRET_MARKER: &str = "super_secret_spending_material_xyz";
-    const TOKEN_MARKER: &str = "cashuB_super_secret_bearer_token_marker";
     const PREIMAGE_MARKER: &str = "super_secret_htlc_preimage_xyz";
 
     #[allow(clippy::use_debug)]
@@ -114,7 +110,6 @@ mod tests {
                 ..Default::default()
             },
             memo: None,
-            token: Some(TOKEN_MARKER.to_string()),
             proofs: vec![proof],
             proofs_amount: Amount::from(1),
             active_keyset_id: keyset_id,
@@ -123,8 +118,6 @@ mod tests {
 
         let debug_output = format!("{state:?}");
         assert!(!debug_output.contains(SECRET_MARKER));
-        assert!(!debug_output.contains(TOKEN_MARKER));
         assert!(!debug_output.contains(PREIMAGE_MARKER));
-        assert!(debug_output.contains("[redacted]"));
     }
 }

@@ -6,14 +6,11 @@
 
 use core::fmt;
 
-use cdk_common::wallet::{KeysetLoadPolicy, WalletSaga};
+use cdk_common::wallet::{KeysetLoadPolicy, MintCheckpoint, OperationData, WalletSaga};
 use uuid::Uuid;
 
-use crate::nuts::{BatchMintRequest, Id, PaymentMethod, PreMintSecrets, Proofs};
-use crate::wallet::MintQuote;
-
-/// Type alias for MintRequest with String quote ID
-pub type MintRequestString = crate::nuts::MintRequest<String>;
+use crate::nuts::Proofs;
+use crate::Error;
 
 /// Initial state - operation ID assigned, no work done yet.
 #[derive(Debug)]
@@ -24,124 +21,21 @@ pub struct Initial {
     pub keyset_policy: KeysetLoadPolicy,
 }
 
-/// The mint request type - either single quote or batch.
-pub enum PreparedMintRequest {
-    /// Single quote mint request (legacy NUT-04)
-    Single {
-        /// Quote ID being minted
-        quote_id: String,
-        /// Quote information
-        quote_info: MintQuote,
-        /// Mint request ready to send
-        request: MintRequestString,
-    },
-    /// Batch mint request (NUT-29)
-    Batch {
-        /// Quote IDs being minted
-        quote_ids: Vec<String>,
-        /// Quote information for each quote
-        quote_infos: Vec<MintQuote>,
-        /// Number of consecutive outputs assigned to each quote
-        output_counts: Vec<usize>,
-        /// Batch mint request ready to send
-        request: BatchMintRequest<String>,
-    },
-}
-
-impl fmt::Debug for PreparedMintRequest {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Single {
-                quote_id,
-                quote_info,
-                request,
-            } => f
-                .debug_struct("PreparedMintRequest::Single")
-                .field("quote_id", quote_id)
-                .field("mint_url", &quote_info.mint_url)
-                .field("payment_method", &quote_info.payment_method)
-                .field("amount", &quote_info.amount)
-                .field("unit", &quote_info.unit)
-                .field("state", &quote_info.state)
-                .field(
-                    "output_amounts",
-                    &request
-                        .outputs
-                        .iter()
-                        .map(|output| output.amount)
-                        .collect::<Vec<_>>(),
-                )
-                .field("has_signature", &request.signature.is_some())
-                .finish(),
-            Self::Batch {
-                quote_ids,
-                quote_infos,
-                output_counts,
-                request,
-            } => f
-                .debug_struct("PreparedMintRequest::Batch")
-                .field("quote_ids", quote_ids)
-                .field(
-                    "quote_amounts",
-                    &quote_infos
-                        .iter()
-                        .map(|quote| quote.amount)
-                        .collect::<Vec<_>>(),
-                )
-                .field(
-                    "output_amounts",
-                    &request
-                        .outputs
-                        .iter()
-                        .map(|output| output.amount)
-                        .collect::<Vec<_>>(),
-                )
-                .field("output_counts", output_counts)
-                .field("has_signatures", &request.signatures.is_some())
-                .finish(),
-        }
-    }
-}
-
-/// Prepared state - quote validated, premint secrets created, ready to execute.
+/// Prepared state - the original request and secrets are held only in the saved saga.
+#[derive(Debug)]
 pub struct Prepared {
-    /// Unique operation identifier
-    pub operation_id: Uuid,
-    /// Active keyset ID
-    pub active_keyset_id: Id,
-    /// Premint secrets
-    pub premint_secrets: PreMintSecrets,
-    /// Mint request (single or batch)
-    pub mint_request: PreparedMintRequest,
-    /// Payment method (Bolt11 or Bolt12)
-    pub payment_method: PaymentMethod,
     /// Policy controlling how keysets are loaded
     pub keyset_policy: KeysetLoadPolicy,
     /// Persisted saga for optimistic locking and recovery
     pub saga: WalletSaga,
 }
 
-impl fmt::Debug for Prepared {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Prepared")
-            .field("operation_id", &self.operation_id)
-            .field("active_keyset_id", &self.active_keyset_id)
-            .field(
-                "premint_amounts",
-                &self
-                    .premint_secrets
-                    .secrets
-                    .iter()
-                    .map(|secret| secret.amount)
-                    .collect::<Vec<_>>(),
-            )
-            .field("mint_request", &self.mint_request)
-            .field("payment_method", &self.payment_method)
-            .field("keyset_policy", &self.keyset_policy)
-            .field("saga_id", &self.saga.id)
-            .field("saga_state", &self.saga.state)
-            .field("saga_version", &self.saga.version)
-            .finish()
+impl Prepared {
+    pub(super) fn checkpoint(&self) -> Result<&MintCheckpoint, Error> {
+        let OperationData::Mint(data) = &self.saga.data else {
+            return Err(Error::InvalidOperationState);
+        };
+        super::checkpoint::get(data)
     }
 }
 
@@ -169,102 +63,52 @@ impl fmt::Debug for Finalized {
 #[cfg(test)]
 mod tests {
     use cdk_common::wallet::{
-        IssueSagaState, KeysetLoadPolicy, MintOperationData, OperationData, WalletSaga,
-        WalletSagaState,
+        IssueSagaState, KeysetLoadPolicy, OperationData, WalletSaga, WalletSagaState,
     };
     use cdk_common::CurrencyUnit;
     use uuid::Uuid;
 
-    use super::{Finalized, Prepared, PreparedMintRequest};
-    use crate::nuts::{MintQuoteState, MintRequest, PaymentMethod, PreMintSecrets, SecretKey};
+    use super::{Finalized, Prepared};
+    use crate::nuts::{PreMintSecrets, SecretKey};
     use crate::secret::Secret;
-    use crate::wallet::test_utils::{test_keyset_id, test_mint_url, test_proof};
-    use crate::wallet::MintQuote;
-    use crate::Amount;
-
-    const SECRET_MARKER: &str = "super_secret_spending_material_xyz";
-    const QUOTE_ID: &str = "debuggable-mint-quote-id";
-
-    fn mint_saga(operation_id: Uuid) -> WalletSaga {
-        WalletSaga::new(
-            operation_id,
-            WalletSagaState::Issue(IssueSagaState::SecretsPrepared),
-            Amount::from(1),
-            test_mint_url(),
-            CurrencyUnit::Sat,
-            OperationData::Mint(MintOperationData::new_single(
-                QUOTE_ID.to_string(),
-                Amount::from(1),
-                Some(0),
-                Some(1),
-                None,
-            )),
-        )
-    }
+    use crate::wallet::test_utils::{
+        test_issue_data, test_keyset_id, test_mint_quote, test_mint_url, test_proof,
+    };
 
     #[allow(clippy::use_debug)]
     #[test]
     fn issue_state_debug_redacts_secrets_but_keeps_quote_ids() {
-        let operation_id = Uuid::new_v4();
+        let marker = "super_secret_spending_material_xyz";
         let keyset_id = test_keyset_id();
-        let premint_secrets = PreMintSecrets::from_secrets(
-            keyset_id,
-            vec![Amount::from(1)],
-            vec![Secret::new(SECRET_MARKER)],
-        )
-        .expect("valid pre-mint secret");
-        let outputs = premint_secrets
-            .secrets
-            .iter()
-            .map(|secret| secret.blinded_message.clone())
-            .collect();
-        let quote_signing_key = SecretKey::generate();
-        let quote_signing_key_hex = quote_signing_key.to_secret_hex();
-        let mint_request = PreparedMintRequest::Single {
-            quote_id: QUOTE_ID.to_string(),
-            quote_info: MintQuote {
-                id: QUOTE_ID.to_string(),
-                mint_url: test_mint_url(),
-                payment_method: PaymentMethod::BOLT11,
-                amount: Some(Amount::from(1)),
-                unit: CurrencyUnit::Sat,
-                request: "lnbc1debug-payment-request".to_string(),
-                state: MintQuoteState::Paid,
-                expiry: 0,
-                secret_key: Some(quote_signing_key),
-                amount_issued: Amount::ZERO,
-                amount_paid: Amount::from(1),
-                updated_at: 0,
-                estimated_blocks: None,
-                used_by_operation: None,
-                version: 0,
-            },
-            request: MintRequest {
-                quote: QUOTE_ID.to_string(),
-                outputs,
-                signature: Some("debug-signature".to_string()),
-            },
-        };
+        let premint_secrets =
+            PreMintSecrets::from_secrets(keyset_id, vec![1.into()], vec![Secret::new(marker)])
+                .unwrap();
+        let signing_key = SecretKey::generate();
+        let signing_key_hex = signing_key.to_secret_hex();
+        let mut quote = test_mint_quote(test_mint_url());
+        quote.secret_key = Some(signing_key);
+        let quote_id = quote.id.clone();
         let prepared = Prepared {
-            operation_id,
-            active_keyset_id: keyset_id,
-            premint_secrets,
-            mint_request,
-            payment_method: PaymentMethod::BOLT11,
             keyset_policy: KeysetLoadPolicy::default(),
-            saga: mint_saga(operation_id),
+            saga: WalletSaga::new(
+                Uuid::new_v4(),
+                WalletSagaState::Issue(IssueSagaState::SecretsPrepared),
+                1.into(),
+                test_mint_url(),
+                CurrencyUnit::Sat,
+                OperationData::Mint(test_issue_data(quote, premint_secrets)),
+            ),
         };
         let mut proof = test_proof(keyset_id, 1);
-        proof.secret = Secret::new(SECRET_MARKER);
+        proof.secret = Secret::new(marker);
         let finalized = Finalized {
             proofs: vec![proof],
         };
-
         let prepared_debug = format!("{prepared:?}");
         let finalized_debug = format!("{finalized:?}");
-        assert!(!prepared_debug.contains(SECRET_MARKER));
-        assert!(!prepared_debug.contains(&quote_signing_key_hex));
-        assert!(!finalized_debug.contains(SECRET_MARKER));
-        assert!(prepared_debug.contains(QUOTE_ID));
+        assert!(!prepared_debug.contains(marker));
+        assert!(!prepared_debug.contains(&signing_key_hex));
+        assert!(!finalized_debug.contains(marker));
+        assert!(prepared_debug.contains(&quote_id));
     }
 }

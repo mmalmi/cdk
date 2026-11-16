@@ -5,6 +5,7 @@
 use std::collections::HashMap;
 use std::fmt::Debug;
 
+use cdk_common::database::wallet::IncompleteSagaReader;
 use cdk_common::Id;
 use tracing::instrument;
 use uuid::Uuid;
@@ -14,8 +15,11 @@ use crate::nuts::nut00::ProofsMethods;
 use crate::nuts::{Proofs, Token};
 use crate::{Amount, Error, Wallet};
 
+mod amounts;
+mod recovery;
 pub(crate) mod saga;
 
+use self::amounts::SendAmounts;
 use saga::SendSaga;
 
 /// Prepared send transaction
@@ -66,7 +70,8 @@ impl PreparedSend<'_> {
         &self.proofs_to_send
     }
 
-    /// Fee the recipient will pay to redeem the token
+    /// Reserve included for the recipient's redemption fee.
+    /// Denomination rounding may leave the recipient more than the requested amount.
     pub fn send_fee(&self) -> Amount {
         self.send_fee
     }
@@ -238,50 +243,58 @@ impl Wallet {
             .await?
             .ok_or(Error::Custom("Saga not found".to_string()))?;
 
-        let saga = SendSaga::from_prepared(
+        saga::cancellation::validate(
             self,
-            operation_id,
-            Amount::ZERO,           // Dummy
-            SendOptions::default(), // Dummy
-            proofs_to_swap,
-            proofs_to_send,
-            Amount::ZERO, // Dummy
-            Amount::ZERO, // Dummy
-            db_saga,
+            &db_saga,
+            db_saga.amount,
+            proofs_to_swap.iter().chain(&proofs_to_send),
         )?;
-        saga.cancel().await
+        saga::cancellation::complete(self, db_saga).await
     }
 
     /// Returns operation IDs for pending sends (tokens created but not claimed).
     #[instrument(skip(self))]
     pub async fn get_pending_sends(&self) -> Result<Vec<Uuid>, Error> {
-        let incomplete = self.localstore.get_incomplete_sagas().await?;
-        Ok(incomplete
-            .into_iter()
-            .filter_map(|s| {
-                if s.mint_url != self.mint_url {
-                    return None;
-                }
-                if let cdk_common::wallet::WalletSagaState::Send(
-                    cdk_common::wallet::SendSagaState::TokenCreated,
-                ) = s.state
-                {
-                    Some(s.id)
-                } else {
-                    None
-                }
-            })
-            .collect())
+        let mut sagas = IncompleteSagaReader::new(self.localstore.as_ref());
+        let mut pending = Vec::new();
+        while let Some(saga) = sagas.next().await? {
+            if saga.mint_url == self.mint_url
+                && matches!(
+                    saga.state,
+                    cdk_common::wallet::WalletSagaState::Send(
+                        cdk_common::wallet::SendSagaState::TokenCreated
+                    )
+                )
+            {
+                pending.push(saga.id);
+            }
+        }
+        Ok(pending)
     }
 
-    /// Reclaims funds by swapping proofs back to the wallet.
+    /// Reclaim an unclaimed token, resuming the saved request after interruption.
+    /// Retries return the original net refund while its refund receipt is retained.
     #[instrument(skip(self))]
     pub async fn revoke_send(&self, operation_id: Uuid) -> Result<Amount, Error> {
-        let saga_record = self
-            .localstore
-            .get_saga(&operation_id)
-            .await?
-            .ok_or(Error::Custom("Saga not found".to_string()))?;
+        let Some(saga_record) = self.localstore.get_saga(&operation_id).await? else {
+            return saga::reclaim::receipt(self, operation_id)
+                .await?
+                .ok_or(Error::TransactionNotFound);
+        };
+        if saga_record.mint_url != self.mint_url || saga_record.unit != self.unit {
+            return Err(Error::InvalidOperationState);
+        }
+        if matches!(
+            saga_record.state,
+            cdk_common::wallet::WalletSagaState::Send(
+                cdk_common::wallet::SendSagaState::ReclaimPreparing
+                    | cdk_common::wallet::SendSagaState::ReclaimCancelling
+                    | cdk_common::wallet::SendSagaState::Reclaiming
+                    | cdk_common::wallet::SendSagaState::Reclaimed
+            )
+        ) {
+            return saga::reclaim::complete(self, saga_record, true).await;
+        }
 
         if let cdk_common::wallet::WalletSagaState::Send(
             cdk_common::wallet::SendSagaState::TokenCreated,
@@ -294,7 +307,6 @@ impl Wallet {
 
                 let saga = SendSaga {
                     wallet: self,
-                    compensations: crate::wallet::saga::new_compensations(),
                     state_data: saga::state::TokenCreated {
                         operation_id,
                         proofs,
@@ -318,14 +330,27 @@ impl Wallet {
             .await?
             .ok_or(Error::Custom("Saga not found".to_string()))?;
 
-        // Report as pending during rollback to prevent race condition where swap
-        // makes proofs appear spent before revocation completes.
+        if saga_record.mint_url != self.mint_url || saga_record.unit != self.unit {
+            return Err(Error::InvalidOperationState);
+        }
+        if saga_record.state
+            == cdk_common::wallet::WalletSagaState::Send(cdk_common::wallet::SendSagaState::Claimed)
+        {
+            saga::claim::complete(self, saga_record).await?;
+            return Ok(true);
+        }
+
+        // A reclaim spends the token too; it is not a recipient claim.
         if let cdk_common::wallet::WalletSagaState::Send(
-            cdk_common::wallet::SendSagaState::RollingBack,
+            cdk_common::wallet::SendSagaState::RollingBack
+            | cdk_common::wallet::SendSagaState::ReclaimPreparing
+            | cdk_common::wallet::SendSagaState::ReclaimCancelling
+            | cdk_common::wallet::SendSagaState::Reclaiming
+            | cdk_common::wallet::SendSagaState::Reclaimed,
         ) = saga_record.state
         {
             tracing::debug!(
-                "Operation {} is rolling back - returning pending status",
+                "Operation {} is reclaiming - returning pending status",
                 operation_id
             );
             return Ok(false);
@@ -342,7 +367,6 @@ impl Wallet {
 
                 let saga = SendSaga {
                     wallet: self,
-                    compensations: crate::wallet::saga::new_compensations(),
                     state_data: saga::state::TokenCreated {
                         operation_id,
                         proofs,
@@ -374,7 +398,7 @@ pub struct ProofSplitResult {
 /// Splits proofs between those that can be sent directly and those requiring swap.
 pub(crate) fn split_proofs_for_send(
     proofs: Proofs,
-    send_amounts: &[Amount],
+    send_amounts: &[(Amount, u64)],
     amount: Amount,
     send_fee: Amount,
     keyset_fees: &HashMap<Id, u64>,
@@ -389,18 +413,7 @@ pub(crate) fn split_proofs_for_send(
     } else if is_exact_or_offline {
         proofs_to_send = proofs;
     } else {
-        let mut remaining_send_amounts: Vec<Amount> = send_amounts.to_vec();
-        for proof in proofs {
-            if let Some(idx) = remaining_send_amounts
-                .iter()
-                .position(|a| a == &proof.amount)
-            {
-                proofs_to_send.push(proof);
-                remaining_send_amounts.remove(idx);
-            } else {
-                proofs_to_swap.push(proof);
-            }
-        }
+        (proofs_to_send, proofs_to_swap) = amounts::partition(proofs, send_amounts);
 
         // Check if swap is actually needed
         if !proofs_to_swap.is_empty() {
@@ -482,8 +495,11 @@ mod tests {
         fees
     }
 
-    fn amounts(values: &[u64]) -> Vec<Amount> {
-        values.iter().map(|&v| Amount::from(v)).collect()
+    fn amounts(values: &[u64]) -> SendAmounts {
+        values
+            .iter()
+            .map(|&value| (Amount::from(value), 1))
+            .collect()
     }
 
     // ========================================================================

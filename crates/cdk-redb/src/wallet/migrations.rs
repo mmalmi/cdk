@@ -288,6 +288,7 @@ mod tests {
         let database = Arc::new(Database::create(database_path).expect("database"));
         let saga_id = uuid::Uuid::new_v4();
         let transaction = Transaction {
+            role: Default::default(),
             mint_url: MintUrl::from_str("https://mint.example.com").expect("valid mint URL"),
             direction: TransactionDirection::Outgoing,
             amount: Amount::from(10),

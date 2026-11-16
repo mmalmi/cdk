@@ -6,12 +6,29 @@
 
 use core::fmt;
 
-use cdk_common::wallet::{KeysetLoadPolicy, WalletSaga};
+use cdk_common::wallet::{KeysetLoadPolicy, SendSagaState, WalletSaga, WalletSagaState};
 use uuid::Uuid;
 
 use crate::nuts::Proofs;
 use crate::wallet::send::SendOptions;
-use crate::Amount;
+use crate::{Amount, Error, Wallet};
+
+pub(super) async fn transition(
+    wallet: &Wallet,
+    saga: &mut WalletSaga,
+    state: SendSagaState,
+) -> Result<(), Error> {
+    if saga.version == u32::MAX {
+        return Err(Error::InvalidOperationState);
+    }
+    let mut next = saga.clone();
+    next.update_state(WalletSagaState::Send(state));
+    if !wallet.localstore.update_saga(next.clone()).await? {
+        return Err(Error::ConcurrentUpdate);
+    }
+    *saga = next;
+    Ok(())
+}
 
 /// Initial state before any work is done.
 #[derive(Debug)]
@@ -36,7 +53,8 @@ pub struct Prepared {
     pub swap_fee: Amount,
     /// Proofs that will be included in the token directly
     pub proofs_to_send: Proofs,
-    /// Fee the recipient will pay to redeem the token
+    /// Reserve included for the recipient's redemption fee.
+    /// Denomination rounding may leave the recipient more than the requested amount.
     pub send_fee: Amount,
     /// The persisted saga for optimistic locking
     pub saga: WalletSaga,
@@ -127,6 +145,9 @@ mod tests {
             test_mint_url(),
             CurrencyUnit::Sat,
             OperationData::Send(SendOperationData {
+                preparation: None,
+                confirmation: None,
+                reclaim: None,
                 amount,
                 memo: None,
                 counter_start: None,

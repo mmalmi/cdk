@@ -10,7 +10,7 @@ use cdk::wallet::wallet_repository::{
 
 use crate::error::FfiError;
 use crate::types::*;
-use crate::wallet::RateLimit;
+use crate::wallet::{ProofInventoryLimits, RateLimit};
 
 /// Configuration for creating a wallet repository.
 ///
@@ -18,6 +18,12 @@ use crate::wallet::RateLimit;
 /// hands out shares one limiter, so there is no per-wallet equivalent.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct WalletRepositoryConfig {
+    /// Maximum newly created outputs per swap or mint request, including change.
+    #[uniffi(default = None)]
+    pub max_outputs: Option<u32>,
+    /// Row and stored-byte limits for new-operation inventory reads.
+    #[uniffi(default = None)]
+    pub proof_inventory_limits: Option<ProofInventoryLimits>,
     /// Proxy used by every mint operation. Omit for a direct connection.
     #[uniffi(default = None)]
     pub proxy_url: Option<String>,
@@ -145,6 +151,13 @@ impl WalletRepository {
             let mut builder = WalletRepositoryBuilder::new()
                 .localstore(localstore)
                 .seed(seed);
+
+            if let Some(maximum) = config.max_outputs {
+                builder = builder.with_max_outputs(maximum);
+            }
+            if let Some(limits) = config.proof_inventory_limits {
+                builder = builder.with_proof_inventory_limits(limits.max_proofs, limits.max_bytes);
+            }
 
             if let Some(proxy_url) = proxy_url {
                 builder = builder.proxy_url(proxy_url);
@@ -460,6 +473,8 @@ mod tests {
             MNEMONIC.to_string(),
             custom_wallet_store(db),
             WalletRepositoryConfig {
+                max_outputs: None,
+                proof_inventory_limits: None,
                 proxy_url: None,
                 rate_limit,
             },

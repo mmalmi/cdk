@@ -900,6 +900,7 @@ mod tests {
 
     fn sample_transaction(timestamp: u64) -> Transaction {
         Transaction {
+            role: Default::default(),
             mint_url: MintUrl::from_str("https://mint.example.com").expect("mint url"),
             direction: TransactionDirection::Incoming,
             amount: Amount::from(10u64),

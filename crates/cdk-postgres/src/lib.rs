@@ -230,6 +230,7 @@ impl DatabasePool for PgConnectionPool {
 #[derive(Debug)]
 pub struct PostgresConnection {
     timeout: Duration,
+    stale: Arc<AtomicBool>,
     error: Arc<Mutex<Option<cdk_common::database::Error>>>,
     result: Arc<OnceLock<Client>>,
     notify: Arc<Notify>,
@@ -244,6 +245,7 @@ impl PostgresConnection {
         let error_clone = failed.clone();
         let result_clone = result.clone();
         let notify_clone = notify.clone();
+        let connection_stale = stale.clone();
 
         async fn select_schema(conn: &Client, schema: &str) -> Result<(), Error> {
             conn.batch_execute(&format!(
@@ -322,6 +324,7 @@ impl PostgresConnection {
         });
 
         Self {
+            stale: connection_stale,
             error: failed,
             timeout,
             result,
@@ -359,6 +362,10 @@ impl PostgresConnection {
 
 #[async_trait::async_trait]
 impl DatabaseConnector for PostgresConnection {
+    fn mark_unusable(&mut self) {
+        self.stale.store(true, std::sync::atomic::Ordering::Release);
+    }
+
     type Transaction = GenericTransactionHandler<Self>;
 }
 
@@ -541,6 +548,134 @@ mod test {
     }
 
     wallet_db_test!(provide_wallet_db);
+    wallet_db_test!(provide_wallet_db, kv_read_bounded_contract);
+    wallet_db_test!(
+        provide_wallet_db,
+        proofs_created_by_operation_pages,
+        proofs_created_by_operation_page_limits,
+        proofs_created_by_operation_cursor_survives_deletion,
+    );
+
+    #[tokio::test]
+    async fn complete_melt_failed_parent_write_rolls_back_receipt_and_quote() {
+        use cdk_common::database::wallet::test::melt_completion_fixture;
+        use cdk_common::database::WalletDatabase;
+
+        let schema = format!("melt_completion_{}", uuid::Uuid::new_v4().simple());
+        let db = provide_wallet_db(schema.clone()).await;
+        let url = std::env::var("CDK_MINTD_DATABASE_URL")
+            .or_else(|_| std::env::var("PG_DB_URL"))
+            .unwrap_or_else(|_| {
+                "host=localhost user=cdk_user password=cdk_password dbname=cdk_mint port=5432"
+                    .to_owned()
+            });
+        let (raw, connection) = tokio_postgres::connect(&url, NoTls).await.unwrap();
+        let task = tokio::spawn(connection);
+        raw.batch_execute(&format!("SET search_path TO \"{schema}\"; CREATE FUNCTION fail_completion() RETURNS trigger AS $$ BEGIN RAISE EXCEPTION 'injected write failure'; END; $$ LANGUAGE plpgsql; CREATE TRIGGER fail_completion BEFORE UPDATE ON wallet_sagas FOR EACH ROW EXECUTE FUNCTION fail_completion();")).await.unwrap();
+        let (saga, next, quote, pending) = melt_completion_fixture();
+        db.add_melt_quote(quote.clone()).await.unwrap();
+        db.add_saga(saga.clone()).await.unwrap();
+        db.add_transaction(pending.clone()).await.unwrap();
+        assert!(db.complete_melt(&saga, next.clone(), &quote).await.is_err());
+        assert_eq!(db.get_saga(&saga.id).await.unwrap(), Some(saga.clone()));
+        assert_eq!(
+            db.get_melt_quote(&quote.id).await.unwrap(),
+            Some(quote.clone())
+        );
+        assert_eq!(
+            db.get_transaction(pending.id()).await.unwrap(),
+            Some(pending)
+        );
+        raw.batch_execute("DROP TRIGGER fail_completion ON wallet_sagas;")
+            .await
+            .unwrap();
+        assert!(db.complete_melt(&saga, next, &quote).await.unwrap());
+        drop(raw);
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn acquire_melt_failed_saga_insert_rolls_back_quote_and_proofs() {
+        use cdk_common::database::wallet::test::melt_acquisition_fixture;
+        use cdk_common::database::WalletDatabase;
+
+        let schema = format!("melt_acquisition_{}", uuid::Uuid::new_v4().simple());
+        let db = provide_wallet_db(schema.clone()).await;
+        let url = std::env::var("CDK_MINTD_DATABASE_URL")
+            .or_else(|_| std::env::var("PG_DB_URL"))
+            .unwrap_or_else(|_| {
+                "host=localhost user=cdk_user password=cdk_password dbname=cdk_mint port=5432"
+                    .to_owned()
+            });
+        let (raw, connection) = tokio_postgres::connect(&url, NoTls).await.unwrap();
+        let task = tokio::spawn(connection);
+        raw.batch_execute(&format!("SET search_path TO \"{schema}\"; CREATE FUNCTION fail_acquisition() RETURNS trigger AS $$ BEGIN RAISE EXCEPTION 'injected write failure'; END; $$ LANGUAGE plpgsql; CREATE TRIGGER fail_acquisition BEFORE INSERT ON wallet_sagas FOR EACH ROW EXECUTE FUNCTION fail_acquisition();")).await.unwrap();
+        let (quote, saga, local) = melt_acquisition_fixture();
+        db.add_melt_quote(quote.clone()).await.unwrap();
+        db.update_proofs(vec![local.clone()], vec![]).await.unwrap();
+        assert!(db.acquire_melt(&saga, &quote).await.is_err());
+        assert!(db.get_saga(&saga.id).await.unwrap().is_none());
+        assert_eq!(
+            db.get_melt_quote(&quote.id).await.unwrap(),
+            Some(quote.clone())
+        );
+        assert_eq!(
+            db.get_proofs(None, None, None, None).await.unwrap(),
+            vec![local]
+        );
+        raw.batch_execute("DROP TRIGGER fail_acquisition ON wallet_sagas;")
+            .await
+            .unwrap();
+        assert!(db.acquire_melt(&saga, &quote).await.unwrap());
+        drop(raw);
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn wallet_proof_batch_overflow_rolls_back() {
+        use std::str::FromStr;
+
+        use cdk_common::database::wallet::ProofChange;
+        use cdk_common::database::WalletDatabase;
+        use cdk_common::secret::Secret;
+        use cdk_common::wallet::ProofInfo;
+        use cdk_common::{Amount, CurrencyUnit, Id, Proof, SecretKey, State};
+
+        let db = provide_wallet_db(format!("test_proof_overflow_{}", uuid::Uuid::new_v4())).await;
+        let make_proof = || {
+            ProofInfo::new(
+                Proof::new(
+                    Amount::from(8),
+                    Id::from_str("00916bbf7ef91a36").unwrap(),
+                    Secret::generate(),
+                    SecretKey::generate().public_key(),
+                ),
+                "https://mint.example.com".parse().unwrap(),
+                State::Unspent,
+                CurrencyUnit::Sat,
+            )
+            .unwrap()
+        };
+        let first = make_proof();
+        let mut overflow = make_proof();
+        // PostgreSQL's existing INTEGER column cannot represent this value.
+        // Reject it without changing the earlier record in the same transaction.
+        overflow.derivation_index = Some(u32::MAX);
+        let changes = [first.clone(), overflow.clone()]
+            .into_iter()
+            .map(|proof| ProofChange {
+                y: proof.y,
+                before: None,
+                after: Some(proof),
+            })
+            .collect();
+        assert!(db.compare_and_swap_proofs(changes, None).await.is_err());
+        assert!(db
+            .get_proofs_by_ys(vec![first.y, overflow.y])
+            .await
+            .unwrap()
+            .is_empty());
+    }
 
     #[tokio::test]
     async fn failed_initial_connect_marks_connection_stale() {

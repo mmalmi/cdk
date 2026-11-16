@@ -36,14 +36,24 @@ use crate::Amount;
 mod issue;
 mod melt;
 mod receive;
+mod references;
 mod send;
+mod send_confirmation;
+mod send_preparation;
+mod send_reclaim;
 mod swap;
+mod swap_checkpoint;
 
-pub use issue::{IssueSagaState, MintOperationData};
-pub use melt::{MeltOperationData, MeltSagaState};
-pub use receive::{ReceiveOperationData, ReceiveSagaState};
+pub use issue::{IssueSagaState, MintCheckpoint, MintOperationData, MintRequestData};
+pub use receive::{ReceiveCheckpoint, ReceiveOperationData, ReceiveSagaState};
 pub use send::{SendOperationData, SendSagaState};
+pub use send_confirmation::{SendConfirmation, SwapOutputs};
+pub use send_preparation::SendPreparation;
 pub use swap::{SwapOperationData, SwapSagaState};
+
+pub use self::melt::{MeltOperationData, MeltPayment, MeltSagaState, MeltSwap};
+pub use self::send_reclaim::SendReclaim;
+pub use self::swap_checkpoint::SwapCheckpoint;
 
 /// Wallet saga state for different operation types
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, Serialize, Deserialize)]
@@ -77,16 +87,30 @@ impl WalletSagaState {
     pub fn state_str(&self) -> &'static str {
         match self {
             WalletSagaState::Send(s) => match s {
+                SendSagaState::PreparedAcquiring => "prepared_acquiring",
                 SendSagaState::ProofsReserved => "proofs_reserved",
+                SendSagaState::PreparedCancelling => "prepared_cancelling",
+                SendSagaState::PreparedCancelled => "prepared_cancelled",
+                SendSagaState::Confirming => "confirming",
                 SendSagaState::TokenCreated => "token_created",
                 SendSagaState::RollingBack => "rolling_back",
+                SendSagaState::ReclaimPreparing => "reclaim_preparing",
+                SendSagaState::ReclaimCancelling => "reclaim_cancelling",
+                SendSagaState::Reclaiming => "reclaiming",
+                SendSagaState::Reclaimed => "reclaimed",
+                SendSagaState::Claimed => "claimed",
             },
             WalletSagaState::Receive(s) => match s {
-                ReceiveSagaState::ProofsPending => "proofs_pending",
-                ReceiveSagaState::SwapRequested => "swap_requested",
+                ReceiveSagaState::InputsRecorded => "inputs_recorded",
+                ReceiveSagaState::Cancelling => "cancelling",
+                ReceiveSagaState::Redeeming => "redeeming",
+                ReceiveSagaState::OutputsReady => "outputs_ready",
+                ReceiveSagaState::Completed => "completed",
             },
             WalletSagaState::Swap(s) => match s {
                 SwapSagaState::ProofsReserved => "proofs_reserved",
+                SwapSagaState::Cancelling => "cancelling",
+                SwapSagaState::OutputsReady => "outputs_ready",
                 SwapSagaState::SwapRequested => "swap_requested",
             },
             WalletSagaState::Issue(s) => match s {
@@ -95,8 +119,11 @@ impl WalletSagaState {
             },
             WalletSagaState::Melt(s) => match s {
                 MeltSagaState::ProofsReserved => "proofs_reserved",
+                MeltSagaState::SwapCancelling => "swap_cancelling",
                 MeltSagaState::MeltRequested => "melt_requested",
                 MeltSagaState::PaymentPending => "payment_pending",
+                MeltSagaState::PaidReady => "paid_ready",
+                MeltSagaState::Completed => "completed",
             },
         }
     }

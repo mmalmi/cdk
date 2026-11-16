@@ -15,7 +15,6 @@ use tracing::instrument;
 use crate::amount::SplitTarget;
 use crate::nuts::{BatchCheckMintQuoteRequest, Proofs, SecretKey, SpendingConditions};
 use crate::util::unix_time;
-use crate::wallet::recovery::RecoveryAction;
 use crate::wallet::{DerivationCounterNamespace, MintQuote, MintQuoteState};
 use crate::{Amount, Error, Wallet};
 
@@ -335,70 +334,32 @@ impl Wallet {
         Ok(())
     }
 
-    /// This method:
-    /// 1. Fetches the current quote state from the mint
-    /// 2. If there's an in-progress saga for this quote, attempts to complete it
-    /// 3. If the saga was compensated (rolled back), attempts a fresh mint
-    /// 4. Returns the updated quote
+    /// Resume an original issue before refreshing its quote. Missing authority
+    /// keeps ownership intact; only atomic issue retirement may release it.
     #[instrument(skip_all)]
     async fn inner_check_mint_quote_status(
         &self,
         mut mint_quote: MintQuote,
     ) -> Result<MintQuote, Error> {
-        let quote_id = mint_quote.id.clone();
-        // First, check/update the state from the mint
-        self.check_state(&mut mint_quote).await?;
-
-        // Check if there's an in-progress saga for this quote
-        if let Some(ref operation_id_str) = mint_quote.used_by_operation {
-            if let Ok(operation_id) = uuid::Uuid::parse_str(operation_id_str) {
-                match self.localstore.get_saga(&operation_id).await {
-                    Ok(Some(saga)) => {
-                        // Saga exists - try to complete it (like recovery does)
-                        tracing::info!(
-                            "Mint quote {} has in-progress saga {}, attempting to complete",
-                            quote_id,
-                            operation_id
-                        );
-
-                        let recovery_action = self.resume_issue_saga(&saga).await?;
-
-                        // If compensated, the saga was rolled back - attempt to mint again
-                        if recovery_action == RecoveryAction::Compensated {
-                            tracing::info!(
-                                "Saga {} was compensated, attempting fresh mint for quote {}",
-                                operation_id,
-                                quote_id
-                            );
-                        } else {
-                            // If the saga completed we need to get the updated state of the mint quote fn the db
-                            mint_quote = self
-                                .localstore
-                                .get_mint_quote(&quote_id)
-                                .await?
-                                .ok_or(Error::UnknownQuote)?;
-                        }
-                        // If Recovered or Skipped, just continue with the updated quote
-                    }
-                    Ok(None) => {
-                        // Orphaned reservation - release it
-                        tracing::warn!(
-                            "Mint quote {} has orphaned reservation for operation {}, releasing",
-                            quote_id,
-                            operation_id
-                        );
-                        if let Err(e) = self.localstore.release_mint_quote(&operation_id).await {
-                            tracing::warn!("Failed to release orphaned mint quote: {}", e);
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!("Failed to check saga for mint quote {}: {}", quote_id, e);
-                        return Err(Error::Database(e));
-                    }
-                }
-            }
+        if mint_quote.mint_url != self.mint_url || mint_quote.unit != self.unit {
+            return Err(Error::InvalidOperationState);
         }
-
+        if let Some(owner) = &mint_quote.used_by_operation {
+            let id = uuid::Uuid::parse_str(owner).map_err(|_| Error::InvalidOperationState)?;
+            let original = self
+                .localstore
+                .get_saga(&id)
+                .await?
+                .ok_or(Error::InvalidOperationState)?;
+            self.resume_issue_saga(&original).await?;
+            // Retirement advances the quote version. Never write the stale reserved snapshot.
+            mint_quote = self
+                .localstore
+                .get_mint_quote(&mint_quote.id)
+                .await?
+                .ok_or(Error::UnknownQuote)?;
+        }
+        self.check_state(&mut mint_quote).await?;
         self.localstore.add_mint_quote(mint_quote.clone()).await?;
         Ok(mint_quote)
     }
@@ -466,13 +427,42 @@ impl Wallet {
     ///
     /// # Privacy
     ///
-    /// This method retrieves all unissued mint quotes from the local store and
+    /// This method reads this wallet's unissued quotes in bounded pages and
     /// checks their state with the mint. This has a negative privacy effect of
     /// linking all these quotes to a single wallet session.
     #[instrument(skip(self))]
     pub async fn mint_unissued_quotes(&self) -> Result<Amount, Error> {
-        let mint_quotes = self.get_unissued_mint_quotes().await?;
-        self.mint_given_unissued_quotes(mint_quotes).await
+        use cdk_common::database::wallet::MAX_MINT_QUOTE_PAGE_SIZE;
+        use cdk_common::database::Error as DatabaseError;
+
+        let mut after = None;
+        let mut limit = MAX_MINT_QUOTE_PAGE_SIZE;
+        let mut total = Amount::ZERO;
+        loop {
+            let quotes = match self
+                .localstore
+                .get_unissued_mint_quotes_page(
+                    self.mint_url.clone(),
+                    self.unit.clone(),
+                    after.clone(),
+                    limit,
+                )
+                .await
+            {
+                Err(DatabaseError::MintQuotePageTooLarge { .. }) if limit > 1 => {
+                    limit /= 2;
+                    continue;
+                }
+                result => result?,
+            };
+            let Some(last) = quotes.last() else {
+                return Ok(total);
+            };
+            after = Some(last.id.clone());
+            total = total
+                .checked_add(self.mint_given_unissued_quotes(quotes).await?)
+                .ok_or(Error::AmountOverflow)?;
+        }
     }
 
     /// Mint the mintable quotes among a pre-filtered set of unissued quotes.
@@ -587,26 +577,9 @@ impl Wallet {
                     .batch_mint(&mintable_ids, SplitTarget::default(), None, None)
                     .await
                 {
-                    if matches!(err, Error::BatchSizeExceeded { .. }) {
-                        // The mint rejected the request while validating it,
-                        // so nothing was written — e.g. it enforces a smaller
-                        // batch limit than its NUT-29 settings advertise.
-                        // Retrying as individual mint requests is safe.
-                        tracing::warn!(
-                            "Batch mint of {} quotes rejected ({}); using individual requests",
-                            mintable.len(),
-                            err
-                        );
-                        for quote in mintable {
-                            total_amount = total_amount
-                                .checked_add(self.mint_refreshed_quote(quote).await?)
-                                .ok_or(Error::AmountOverflow)?;
-                        }
-                        continue;
-                    }
-
-                    // Do not retry an ambiguous write as individual mint
-                    // requests. The persisted batch saga owns recovery.
+                    // Keep the original batch even after a size rejection: a
+                    // concurrent or earlier submission may still have succeeded.
+                    // Recovery must use the original outputs, not fresh requests.
                     tracing::warn!("Could not batch mint quotes: {}", err);
                     continue;
                 }
@@ -1148,7 +1121,7 @@ mod tests {
         let mock_client = Arc::new(MockMintConnector::new());
         let mut mint_info = crate::wallet::test_utils::test_mint_info();
         mint_info.nuts.nut29 = cdk_common::nut29::Settings::new(Some(100), None);
-        mock_client.set_active_keyset(crate::wallet::test_utils::test_keyset());
+        mock_client.enable_mint_signing();
         mock_client.set_mint_info_response(Ok(mint_info));
         let wallet = create_test_wallet_with_mock(db.clone(), mock_client.clone()).await;
 
@@ -1167,56 +1140,70 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn batch_size_rejection_falls_back_to_individual_minting() {
-        let (wallet, mock_client, quotes) = batch_claim_wallet(2).await;
+    async fn batch_errors_recover_original_request_without_individual_replacement() {
+        for error in [
+            Error::BatchSizeExceeded { actual: 2, max: 1 },
+            Error::Custom("connection reset".to_owned()),
+        ] {
+            let (wallet, mock_client, quotes) = batch_claim_wallet(2).await;
+            let refreshed = quotes.iter().map(paid_bolt11_quote_response).collect();
+            mock_client.push_post_batch_check_mint_quote_status_response(Ok(refreshed));
+            mock_client.push_post_batch_mint_response(Err(error));
 
-        let refreshed = quotes.iter().map(paid_bolt11_quote_response).collect();
-        mock_client.push_post_batch_check_mint_quote_status_response(Ok(refreshed));
-        // The mint enforces a smaller batch limit than it advertises and
-        // rejects the request during validation — nothing was written.
-        mock_client
-            .push_post_batch_mint_response(Err(Error::BatchSizeExceeded { actual: 2, max: 1 }));
-        // The individual retries fail as well (no signatures staged); the
-        // fallback only needs to attempt one request per quote.
-        mock_client.push_post_mint_response(Err(Error::Custom("staged".to_string())));
-        mock_client.push_post_mint_response(Err(Error::Custom("staged".to_string())));
+            assert_eq!(wallet.mint_unissued_quotes().await.unwrap(), Amount::ZERO);
+            let requests = mock_client.post_batch_mint_requests();
+            assert_eq!(requests.len(), 1);
+            assert!(mock_client.post_mint_requests().is_empty());
+            let sagas = wallet.localstore.get_incomplete_sagas().await.unwrap();
+            assert_eq!(sagas.len(), 1);
+            let saga = &sagas[0];
+            for quote in &quotes {
+                assert_eq!(
+                    wallet
+                        .localstore
+                        .get_mint_quote(&quote.id)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .used_by_operation,
+                    Some(saga.id.to_string())
+                );
+            }
 
-        let minted = wallet
-            .mint_unissued_quotes()
-            .await
-            .expect("claim should complete");
-
-        assert_eq!(minted, Amount::ZERO);
-        assert_eq!(mock_client.post_batch_mint_requests().len(), 1);
-        assert_eq!(
-            mock_client.post_mint_requests().len(),
-            2,
-            "a definitive batch-size rejection must retry each quote individually"
-        );
-    }
-
-    #[tokio::test]
-    async fn ambiguous_batch_mint_error_is_left_to_saga_recovery() {
-        let (wallet, mock_client, quotes) = batch_claim_wallet(2).await;
-
-        let refreshed = quotes.iter().map(paid_bolt11_quote_response).collect();
-        mock_client.push_post_batch_check_mint_quote_status_response(Ok(refreshed));
-        // A transport-style failure is an ambiguous write: the batch saga
-        // owns recovery, no individual retry may be attempted.
-        mock_client
-            .push_post_batch_mint_response(Err(Error::Custom("connection reset".to_string())));
-
-        let minted = wallet
-            .mint_unissued_quotes()
-            .await
-            .expect("claim should complete");
-
-        assert_eq!(minted, Amount::ZERO);
-        assert_eq!(mock_client.post_batch_mint_requests().len(), 1);
-        assert_eq!(
-            mock_client.post_mint_requests().len(),
-            0,
-            "ambiguous writes must not be retried as individual mints"
-        );
+            // A later successful replay must recover the exact original batch.
+            assert_eq!(
+                wallet.resume_issue_saga(saga).await.unwrap(),
+                crate::wallet::recovery::RecoveryAction::Recovered
+            );
+            let replayed = mock_client.post_batch_mint_requests();
+            assert_eq!(replayed.len(), 2);
+            assert_eq!(replayed[1], requests[0]);
+            assert!(mock_client.post_mint_requests().is_empty());
+            assert!(wallet
+                .localstore
+                .get_saga(&saga.id)
+                .await
+                .unwrap()
+                .is_none());
+            let proofs = wallet
+                .localstore
+                .get_proofs(None, None, None, None)
+                .await
+                .unwrap();
+            assert_eq!(
+                Amount::try_sum(proofs.iter().map(|proof| proof.proof.amount)).unwrap(),
+                saga.amount
+            );
+            for quote in quotes {
+                assert!(wallet
+                    .localstore
+                    .get_mint_quote(&quote.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .used_by_operation
+                    .is_none());
+            }
+        }
     }
 }

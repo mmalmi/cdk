@@ -9,6 +9,7 @@ use tracing::instrument;
 use crate::nuts::{Proofs, Token};
 use crate::{ensure_cdk, Amount, Error, Wallet};
 
+mod replay;
 pub(crate) mod saga;
 
 pub use cdk_common::wallet::ReceiveOptions;
@@ -19,23 +20,36 @@ impl Wallet {
     ///
     /// This is the internal implementation that uses the saga pattern
     /// for proper crash recovery and compensation.
+    /// Repeating a completed receive is rejected unless `opts.replay_completed`
+    /// explicitly requests its retained original result, without new credit or
+    /// another mint request. Receipt retirement releases that result; spent
+    /// state alone never establishes a successful receive.
     #[instrument(skip_all)]
     pub async fn receive_proofs(
         &self,
         proofs: Proofs,
         opts: ReceiveOptions,
         memo: Option<String>,
-        token: Option<String>,
+        _token: Option<String>,
     ) -> Result<Amount, Error> {
-        self.retry_on_inactive_keyset(|| async {
-            let saga = ReceiveSaga::new(self);
-            let saga = saga
-                .prepare(proofs.clone(), opts.clone(), memo.clone(), token.clone())
-                .await?;
-            let saga = saga.execute().await?;
-            Ok(saga.into_amount())
-        })
-        .await
+        if opts
+            .metadata
+            .contains_key(cdk_common::wallet::receive_identity::METADATA_KEY)
+        {
+            return Err(Error::InvalidOperationState);
+        }
+        if let Some(amount) = replay::completed(self, &proofs).await? {
+            return if opts.replay_completed {
+                Ok(amount)
+            } else {
+                Err(Error::TokenAlreadySpent)
+            };
+        }
+        // A submitted InactiveKeyset may follow an earlier successful request.
+        // Preserve that error and recover the saved intent instead of replanning.
+        let saga = ReceiveSaga::new(self).prepare(proofs, opts, memo).await?;
+        let saga = saga.execute().await?;
+        Ok(saga.into_amount())
     }
 
     /// Receive

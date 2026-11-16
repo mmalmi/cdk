@@ -2,7 +2,7 @@
 //!
 //! Simple container that manages [`Wallet`] instances by mint URL.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 #[cfg(feature = "npubcash")]
 use std::str::FromStr;
@@ -16,7 +16,10 @@ use tracing::instrument;
 use zeroize::Zeroize;
 
 use super::builder::WalletBuilder;
-use super::{AuthMintConnector, Error, MintConnector, RateLimitConfig, RateLimiterManager};
+use super::{
+    AuthMintConnector, Error, MintConnector, MintMetadataLimits, RateLimitConfig,
+    RateLimiterManager,
+};
 use crate::mint_url::MintUrl;
 use crate::nuts::CurrencyUnit;
 #[cfg(all(feature = "tor", not(target_arch = "wasm32")))]
@@ -150,6 +153,10 @@ pub struct WalletRepositoryBuilder {
     proxy_config: Option<url::Url>,
     danger_accept_invalid_certs: bool,
     rate_limit: Option<RateLimitConfig>,
+    max_outputs: Option<u32>,
+    proof_inventory_limits: Option<(u32, u32)>,
+    mint_metadata_limits: Option<MintMetadataLimits>,
+    max_wallets: Option<u32>,
     #[cfg(all(feature = "tor", not(target_arch = "wasm32")))]
     use_tor: bool,
 }
@@ -165,6 +172,10 @@ impl std::fmt::Debug for WalletRepositoryBuilder {
                 &self.danger_accept_invalid_certs,
             )
             .field("rate_limit", &self.rate_limit)
+            .field("max_outputs", &self.max_outputs)
+            .field("proof_inventory_limits", &self.proof_inventory_limits)
+            .field("mint_metadata_limits", &self.mint_metadata_limits)
+            .field("max_wallets", &self.max_wallets)
             .finish()
     }
 }
@@ -184,6 +195,10 @@ impl WalletRepositoryBuilder {
             proxy_config: None,
             danger_accept_invalid_certs: false,
             rate_limit: Some(RateLimitConfig::default()),
+            max_outputs: None,
+            proof_inventory_limits: None,
+            mint_metadata_limits: None,
+            max_wallets: None,
             #[cfg(all(feature = "tor", not(target_arch = "wasm32")))]
             use_tor: false,
         }
@@ -235,6 +250,47 @@ impl WalletRepositoryBuilder {
         self
     }
 
+    /// Limit newly created outputs per swap or mint request for every wallet.
+    ///
+    /// Includes change and applies to loaded wallets and custom connectors.
+    /// The default is no configured limit. Already submitted requests still recover.
+    pub fn with_max_outputs(mut self, maximum: u32) -> Self {
+        self.max_outputs = Some(maximum);
+        self
+    }
+
+    /// Limit unspent inventory reads used by new send, melt and refill planning.
+    ///
+    /// Both row count and stored payload bytes are checked before decoding. An
+    /// oversized inventory is rejected in full; it is never truncated. Defaults
+    /// to no inventory limit. The storage backend must support bounded reads.
+    /// Submitted operations retain their original recovery inputs.
+    pub fn with_proof_inventory_limits(mut self, max_proofs: u32, max_bytes: u32) -> Self {
+        self.proof_inventory_limits = Some((max_proofs, max_bytes));
+        self
+    }
+
+    /// Bound cumulative mint metadata in every created or loaded wallet cache.
+    ///
+    /// Both limits must be positive. Defaults to no configured limit. This
+    /// limits retained metadata, not database projections, total wallet storage
+    /// or transient HTTP replies. Custom connectors inherit the same policy.
+    pub fn with_mint_metadata_limits(mut self, limits: MintMetadataLimits) -> Self {
+        self.mint_metadata_limits = Some(limits);
+        self
+    }
+
+    /// Limit retained wallets, counting each distinct mint and currency unit.
+    ///
+    /// The maximum must be positive. Defaults to no configured limit. Existing
+    /// entries remain usable and replaceable at capacity. Startup checks all
+    /// persisted units before constructing wallets; database projection limits
+    /// must be configured separately on the storage backend.
+    pub fn with_max_wallets(mut self, maximum: u32) -> Self {
+        self.max_wallets = Some(maximum);
+        self
+    }
+
     /// Start with pacing turned off.
     ///
     /// The limiter is still built, so
@@ -252,6 +308,14 @@ impl WalletRepositoryBuilder {
     ///
     /// This only uses persisted mint metadata and does not make network requests.
     pub async fn build(self) -> Result<WalletRepository, Error> {
+        if self.max_wallets == Some(0) {
+            return Err(Error::Custom(
+                "maximum wallet count must be positive".to_owned(),
+            ));
+        }
+        if let Some(limits) = self.mint_metadata_limits {
+            limits.validate()?;
+        }
         let localstore = self
             .localstore
             .ok_or(Error::Custom("localstore is required".into()))?;
@@ -265,6 +329,10 @@ impl WalletRepositoryBuilder {
 
         let wallet = WalletRepository {
             rate_limiter,
+            max_outputs: self.max_outputs,
+            proof_inventory_limits: self.proof_inventory_limits,
+            mint_metadata_limits: self.mint_metadata_limits,
+            max_wallets: self.max_wallets,
             localstore,
             seed,
             wallets: Arc::new(RwLock::new(BTreeMap::new())),
@@ -351,6 +419,10 @@ pub struct WalletRepository {
     /// Hands out one shared rate-limit budget per destination host, injected
     /// into every wallet this repository builds.
     rate_limiter: RateLimiterManager,
+    max_outputs: Option<u32>,
+    proof_inventory_limits: Option<(u32, u32)>,
+    mint_metadata_limits: Option<MintMetadataLimits>,
+    max_wallets: Option<u32>,
     /// Proxy configuration for HTTP clients (optional)
     proxy_config: Option<url::Url>,
     /// Whether proxied HTTPS clients should accept invalid TLS certificates
@@ -485,6 +557,8 @@ impl WalletRepository {
             return Ok(existing.clone());
         }
 
+        self.check_wallet_capacity(wallets.len().saturating_add(1))?;
+
         let wallet = self
             .create_wallet_internal(mint_url, unit, config.as_ref())
             .await?;
@@ -516,16 +590,30 @@ impl WalletRepository {
         unit: CurrencyUnit,
         config: Option<WalletConfig>,
     ) -> Result<Wallet, Error> {
-        let wallet = self
-            .create_wallet_internal(mint_url.clone(), unit.clone(), config.as_ref())
-            .await?;
-
-        // Insert into wallets map using WalletKey
-        let key = WalletKey::new(mint_url, unit);
+        let key = WalletKey::new(mint_url.clone(), unit.clone());
         let mut wallets = self.wallets.write().await;
+        if !wallets.contains_key(&key) {
+            self.check_wallet_capacity(wallets.len().saturating_add(1))?;
+        }
+        let wallet = self
+            .create_wallet_internal(mint_url, unit, config.as_ref())
+            .await?;
         wallets.insert(key, wallet.clone());
 
         Ok(wallet)
+    }
+
+    fn check_wallet_capacity(&self, wallets: usize) -> Result<(), Error> {
+        if let Some(max_wallets) = self.max_wallets {
+            let wallets = wallets as u64;
+            if wallets > u64::from(max_wallets) {
+                return Err(Error::WalletRepositoryTooLarge {
+                    wallets,
+                    max_wallets,
+                });
+            }
+        }
+        Ok(())
     }
 
     /// Wait until the rate-limit budgets drawn down by every wallet in this
@@ -690,29 +778,30 @@ impl WalletRepository {
         let metadata_cache_ttl = config.and_then(|c| c.metadata_cache_ttl);
         let configured_auth_connector = config.and_then(|c| c.auth_connector.clone());
 
-        // Check if custom connector is provided in config
-        if let Some(cfg) = config {
-            if let Some(custom_connector) = &cfg.mint_connector {
-                // Use custom connector with WalletBuilder
-                let mut builder = WalletBuilder::new()
-                    .mint_url(mint_url.clone())
-                    .unit(unit.clone())
-                    .localstore(self.localstore.clone())
-                    .seed(self.seed)
-                    .target_proof_count(target_proof_count)
-                    .with_rate_limiter(self.rate_limiter.clone())
-                    .shared_client(custom_connector.clone());
-
-                if let Some(auth_connector) = configured_auth_connector.clone() {
-                    builder = builder.auth_connector(auth_connector);
-                }
-
-                if let Some(ttl) = metadata_cache_ttl {
-                    builder = builder.set_metadata_cache_ttl(Some(ttl));
-                }
-
-                return builder.build();
-            }
+        let mut builder = WalletBuilder::new()
+            .mint_url(mint_url.clone())
+            .unit(unit.clone())
+            .localstore(self.localstore.clone())
+            .seed(self.seed)
+            .target_proof_count(target_proof_count)
+            .with_rate_limiter(self.rate_limiter.clone());
+        if let Some(maximum) = self.max_outputs {
+            builder = builder.with_max_outputs(maximum);
+        }
+        if let Some((max_proofs, max_bytes)) = self.proof_inventory_limits {
+            builder = builder.with_proof_inventory_limits(max_proofs, max_bytes);
+        }
+        if let Some(limits) = self.mint_metadata_limits {
+            builder = builder.with_mint_metadata_limits(limits);
+        }
+        if let Some(auth_connector) = configured_auth_connector.clone() {
+            builder = builder.auth_connector(auth_connector);
+        }
+        if let Some(ttl) = metadata_cache_ttl {
+            builder = builder.set_metadata_cache_ttl(Some(ttl));
+        }
+        if let Some(custom_connector) = config.and_then(|cfg| cfg.mint_connector.clone()) {
+            return builder.shared_client(custom_connector).build();
         }
 
         // Fall back to existing logic: proxy/Tor/default
@@ -731,21 +820,10 @@ impl WalletRepository {
                     self.danger_accept_invalid_certs,
                 )?) as Arc<dyn AuthMintConnector + Send + Sync>,
             };
-            let mut builder = WalletBuilder::new()
-                .mint_url(mint_url.clone())
-                .unit(unit.clone())
-                .localstore(self.localstore.clone())
-                .seed(self.seed)
-                .target_proof_count(target_proof_count)
-                .with_rate_limiter(self.rate_limiter.clone())
+            builder
                 .client(client)
-                .auth_connector(auth_connector);
-
-            if let Some(ttl) = metadata_cache_ttl {
-                builder = builder.set_metadata_cache_ttl(Some(ttl));
-            }
-
-            builder.build()?
+                .auth_connector(auth_connector)
+                .build()?
         } else {
             #[cfg(all(feature = "tor", not(target_arch = "wasm32")))]
             if let Some(tor) = &self.shared_tor_transport {
@@ -763,61 +841,18 @@ impl WalletRepository {
                     )) as Arc<dyn AuthMintConnector + Send + Sync>
                 });
 
-                let mut builder = WalletBuilder::new()
-                    .mint_url(mint_url.clone())
-                    .unit(unit.clone())
-                    .localstore(self.localstore.clone())
-                    .seed(self.seed)
-                    .target_proof_count(target_proof_count)
-                    .with_rate_limiter(self.rate_limiter.clone())
+                builder
                     .client(client)
-                    .auth_connector(auth_connector);
-
-                if let Some(ttl) = metadata_cache_ttl {
-                    builder = builder.set_metadata_cache_ttl(Some(ttl));
-                }
-
-                builder.build()?
+                    .auth_connector(auth_connector)
+                    .build()?
             } else {
                 // Create wallet with default client
-                let mut builder = WalletBuilder::new()
-                    .mint_url(mint_url.clone())
-                    .unit(unit.clone())
-                    .localstore(self.localstore.clone())
-                    .seed(self.seed)
-                    .target_proof_count(target_proof_count)
-                    .with_rate_limiter(self.rate_limiter.clone());
-
-                if let Some(auth_connector) = configured_auth_connector.clone() {
-                    builder = builder.auth_connector(auth_connector);
-                }
-
-                if let Some(ttl) = metadata_cache_ttl {
-                    builder = builder.set_metadata_cache_ttl(Some(ttl));
-                }
-
                 builder.build()?
             }
 
             #[cfg(not(all(feature = "tor", not(target_arch = "wasm32"))))]
             {
                 // Create wallet with default client
-                let mut builder = WalletBuilder::new()
-                    .mint_url(mint_url.clone())
-                    .unit(unit.clone())
-                    .localstore(self.localstore.clone())
-                    .seed(self.seed)
-                    .target_proof_count(target_proof_count)
-                    .with_rate_limiter(self.rate_limiter.clone());
-
-                if let Some(auth_connector) = configured_auth_connector.clone() {
-                    builder = builder.auth_connector(auth_connector);
-                }
-
-                if let Some(ttl) = metadata_cache_ttl {
-                    builder = builder.set_metadata_cache_ttl(Some(ttl));
-                }
-
                 builder.build()?
             }
         };
@@ -833,7 +868,7 @@ impl WalletRepository {
     #[instrument(skip(self))]
     async fn load_wallets(&self) -> Result<(), Error> {
         let mints = self.localstore.get_mints().await.map_err(Error::Database)?;
-
+        let mut planned = BTreeSet::new();
         for (mint_url, mint_info) in mints {
             let units = mint_info
                 .map(|info| {
@@ -849,11 +884,19 @@ impl WalletRepository {
                 .unwrap_or_else(|| vec![CurrencyUnit::Sat]);
 
             for unit in units {
-                self.get_or_create_wallet(mint_url.clone(), unit, None)
-                    .await?;
+                planned.insert(WalletKey::new(mint_url.clone(), unit));
+                self.check_wallet_capacity(planned.len())?;
             }
         }
-
+        // Publish only after the full catalog fits and every wallet builds.
+        let mut loaded = BTreeMap::new();
+        for key in planned {
+            let wallet = self
+                .create_wallet_internal(key.mint_url.clone(), key.unit.clone(), None)
+                .await?;
+            loaded.insert(key, wallet);
+        }
+        *self.wallets.write().await = loaded;
         Ok(())
     }
 
@@ -1066,6 +1109,9 @@ mod tests {
     use super::*;
     use crate::nuts::{NUT04Settings, Nuts, PaymentMethod};
 
+    #[path = "limits_tests.rs"]
+    mod limits;
+
     async fn create_test_repository() -> WalletRepository {
         let localstore: Arc<dyn WalletDatabase<database::Error> + Send + Sync> = Arc::new(
             cdk_sqlite::wallet::memory::empty()
@@ -1165,6 +1211,66 @@ mod tests {
     async fn test_wallet_repository_creation() {
         let repo = create_test_repository().await;
         assert!(repo.wallets.try_read().is_ok());
+    }
+
+    #[tokio::test]
+    async fn resource_budgets_reach_loaded_and_custom_connector_wallets() {
+        use crate::wallet::test_utils::{create_test_db, test_mint_url, MockMintConnector};
+
+        let db = create_test_db().await;
+        db.add_mint(test_mint_url(), None).await.unwrap();
+        db.update_proofs(
+            vec![crate::wallet::test_utils::test_proof_info(
+                crate::wallet::test_utils::test_keyset_id(),
+                8,
+                test_mint_url(),
+            )],
+            vec![],
+        )
+        .await
+        .unwrap();
+        let repository = WalletRepositoryBuilder::new()
+            .localstore(db)
+            .seed([0; 64])
+            .with_max_outputs(3)
+            .with_proof_inventory_limits(0, 4096)
+            .with_mint_metadata_limits(MintMetadataLimits {
+                max_keysets: 2,
+                max_bytes: 4096,
+            })
+            .build()
+            .await
+            .unwrap();
+        let loaded = repository
+            .get_wallet(&test_mint_url(), &CurrencyUnit::Sat)
+            .await
+            .unwrap();
+        let config = WalletConfig::new().with_mint_connector(Arc::new(MockMintConnector::new()));
+        let custom = repository
+            .create_wallet_internal(test_mint_url(), CurrencyUnit::Sat, Some(&config))
+            .await
+            .unwrap();
+        for wallet in [loaded, custom] {
+            assert_eq!(
+                wallet.metadata_cache.limits(),
+                Some(MintMetadataLimits {
+                    max_keysets: 2,
+                    max_bytes: 4096
+                })
+            );
+            assert!(matches!(
+                wallet.unspent_inventory().await,
+                Err(Error::Database(database::Error::ProofInventoryTooLarge {
+                    proofs: 1,
+                    ..
+                }))
+            ));
+            assert_eq!(wallet.check_output_count(3).unwrap(), 3);
+            assert!(matches!(
+                wallet.check_output_count(4),
+                Err(Error::MaxOutputsExceeded { actual: 4, max: 3 })
+            ));
+        }
     }
 
     #[tokio::test]

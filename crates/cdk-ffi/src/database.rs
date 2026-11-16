@@ -1,9 +1,27 @@
 //! FFI Database bindings
 
+#[cfg(test)]
+mod issue_acquisition;
+#[cfg(test)]
+mod issue_retirement;
+#[cfg(test)]
+mod melt_acquisition;
+#[cfg(test)]
+mod melt_completion;
+#[cfg(test)]
+mod melt_swap;
+#[cfg(test)]
+mod mint_quote_pages;
+#[cfg(test)]
+mod proof_changes;
+#[cfg(test)]
+mod receive_checkpoint;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use cdk_common::bitcoin::bip32::DerivationPath;
+use cdk_common::database::wallet::SagaCursor;
 use cdk_common::database::WalletDatabase as CdkWalletDatabase;
 use cdk_common::wallet::WalletSaga;
 
@@ -12,6 +30,15 @@ use crate::error::FfiError;
 use crate::postgres::WalletPostgresDatabase;
 use crate::sqlite::WalletSqliteDatabase;
 use crate::types::*;
+
+/// Bounded pending-quote lookup, including the retryable stored-size limit.
+#[derive(Debug, uniffi::Enum)]
+pub enum MintQuotePage {
+    /// Quotes for the requested mint and unit in ascending ID order.
+    Rows { quotes: Vec<MintQuote> },
+    /// The backend measured the stored payload before decoding any rows.
+    TooLarge { bytes: u64, limit: u64 },
+}
 
 /// FFI-compatible wallet database trait with all read and write operations
 /// This trait mirrors the CDK WalletDatabase trait structure
@@ -45,6 +72,16 @@ pub trait WalletDatabase: Send + Sync {
     /// Returns bolt11 quotes where nothing has been issued yet (amount_issued = 0) and all bolt12 quotes.
     async fn get_unissued_mint_quotes(&self) -> Result<Vec<MintQuote>, FfiError>;
 
+    /// Read pending quotes for one mint and unit after the exclusive ID cursor.
+    /// Enforce the native row and stored-byte limits before loading records.
+    async fn get_unissued_mint_quotes_page(
+        &self,
+        mint_url: MintUrl,
+        unit: CurrencyUnit,
+        after: Option<String>,
+        limit: u16,
+    ) -> Result<MintQuotePage, FfiError>;
+
     /// Get melt quote from storage
     async fn get_melt_quote(&self, quote_id: String) -> Result<Option<MeltQuote>, FfiError>;
 
@@ -65,6 +102,16 @@ pub trait WalletDatabase: Send + Sync {
 
     /// Get proofs by Y values
     async fn get_proofs_by_ys(&self, ys: Vec<PublicKey>) -> Result<Vec<ProofInfo>, FfiError>;
+
+    /// Read the complete unspent inventory without exceeding either budget.
+    /// Custom stores must fail if they cannot enforce the budgets before decoding.
+    async fn get_unspent_proofs_bounded(
+        &self,
+        _mint_url: MintUrl,
+        _unit: CurrencyUnit,
+        _max_proofs: u32,
+        _max_bytes: u32,
+    ) -> Result<Vec<ProofInfo>, FfiError>;
 
     /// Get balance efficiently using SQL aggregation
     async fn get_balance(
@@ -94,6 +141,15 @@ pub trait WalletDatabase: Send + Sync {
         primary_namespace: String,
         secondary_namespace: String,
         key: String,
+    ) -> Result<Option<Vec<u8>>, FfiError>;
+
+    /// Read a value with a storage-enforced byte limit; never fall back to an unbounded read.
+    async fn kv_read_bounded(
+        &self,
+        primary_namespace: String,
+        secondary_namespace: String,
+        key: String,
+        max_bytes: u32,
     ) -> Result<Option<Vec<u8>>, FfiError>;
 
     /// List keys in a namespace
@@ -146,6 +202,15 @@ pub trait WalletDatabase: Send + Sync {
         removed_ys: Vec<PublicKey>,
     ) -> Result<(), FfiError>;
 
+    /// Compare complete original records and apply all changes atomically.
+    /// If provided, the complete saved saga must match in the same transaction.
+    /// Unsupported backends must fail without applying any changes.
+    async fn compare_and_swap_proofs(
+        &self,
+        changes: Vec<ProofChange>,
+        expected_saga_json: Option<String>,
+    ) -> Result<bool, FfiError>;
+
     /// Update proofs state in storage
     async fn update_proofs_state(
         &self,
@@ -193,6 +258,25 @@ pub trait WalletDatabase: Send + Sync {
         keysets: Vec<KeySetInfo>,
     ) -> Result<(), FfiError>;
 
+    /// Persist output keys and admit their storage before allocating secrets.
+    async fn prepare_output_keyset(
+        &self,
+        operation_id: String,
+        mint_url: MintUrl,
+        keyset: KeySet,
+    ) -> Result<(), FfiError>;
+
+    /// Compare and atomically save an output proposal, its keys and counter range.
+    async fn prepare_saga_outputs(
+        &self,
+        expected_json: Option<String>,
+        next_json: String,
+        keyset: KeySet,
+        counter_start: u32,
+        counter_count: u32,
+        receipt: Option<Transaction>,
+    ) -> Result<bool, FfiError>;
+
     /// Add mint quote to storage
     async fn add_mint_quote(&self, quote: MintQuote) -> Result<(), FfiError>;
 
@@ -226,11 +310,41 @@ pub trait WalletDatabase: Send + Sync {
     /// `false` if another instance modified the saga first.
     async fn update_saga(&self, saga_json: String) -> Result<bool, FfiError>;
 
+    /// Opt in only after implementing atomic paid receipt, owned quote and terminal saga publication.
+    fn supports_atomic_melt_completion(&self) -> bool;
+
+    /// Complete only an exact PaidReady parent, owned quote and canonical Pending receipt.
+    /// Return an unsupported error if these three records cannot commit together.
+    async fn complete_melt(
+        &self,
+        expected_json: String,
+        next_json: String,
+        quote: MeltQuote,
+    ) -> Result<bool, FfiError>;
+
+    /// Opt in only after implementing the full atomic receipt/saga contract.
+    fn supports_atomic_saga_completion(&self) -> bool;
+
+    /// Atomically publish a matching receipt and advance an exact parent saga.
+    async fn complete_saga(
+        &self,
+        expected_json: String,
+        next_json: String,
+        receipt: Transaction,
+    ) -> Result<bool, FfiError>;
+
     /// Delete a wallet saga
     async fn delete_saga(&self, id: String) -> Result<(), FfiError>;
 
     /// Get all incomplete sagas (returns JSON serialized sagas)
     async fn get_incomplete_sagas(&self) -> Result<Vec<String>, FfiError>;
+
+    /// Read bounded unfinished operation headers as JSON `SagaCursor` values.
+    async fn get_incomplete_saga_ids(
+        &self,
+        after_json: Option<String>,
+        limit: u16,
+    ) -> Result<Vec<String>, FfiError>;
 
     // ========== Proof reservation methods ==========
 
@@ -252,6 +366,36 @@ pub trait WalletDatabase: Send + Sync {
     async fn get_reserved_proofs(&self, operation_id: String) -> Result<Vec<ProofInfo>, FfiError>;
 
     // ========== Quote reservation methods ==========
+
+    /// Opt in only after implementing the entire atomic issue retirement contract.
+    fn supports_atomic_issue_retirement(&self) -> bool;
+
+    /// Atomically publish original outputs and completed receipts, update and release
+    /// owned quotes, and delete the exact journal. Cancellation supplies no proofs.
+    /// Preserve all evidence on conflict; sequential publication is not supported.
+    async fn retire_issue(
+        &self,
+        saga_json: String,
+        quotes: Vec<MintQuote>,
+        proofs: Option<Vec<ProofChange>>,
+    ) -> Result<bool, FfiError>;
+
+    /// Atomically save the new issue saga, pending receipts and every exact quote reservation.
+    /// Return false without writes on conflict, or an error if unsupported.
+    async fn acquire_issue(
+        &self,
+        saga_json: String,
+        quotes: Vec<MintQuote>,
+        keyset: KeySet,
+        counter_start: u32,
+        counter_count: u32,
+    ) -> Result<bool, FfiError>;
+
+    /// Atomically acquire the exact saved proof plan, complete unlocked quote and new saga.
+    /// Return false without writes if any original record or the absent saga does not match.
+    /// Success sets the quote owner and increments its version; reload before further use.
+    /// Return an unsupported error if the backend cannot commit all three parts together.
+    async fn acquire_melt(&self, saga_json: String, quote: MeltQuote) -> Result<bool, FfiError>;
 
     /// Reserve a melt quote for an operation
     async fn reserve_melt_quote(
@@ -305,6 +449,24 @@ impl CdkWalletDatabase<cdk::cdk_database::Error> for WalletDatabaseBridge {
                 primary_namespace.to_string(),
                 secondary_namespace.to_string(),
                 key.to_string(),
+            )
+            .await
+            .map_err(|e| cdk::cdk_database::Error::Database(e.to_string().into()))
+    }
+
+    async fn kv_read_bounded(
+        &self,
+        primary_namespace: &str,
+        secondary_namespace: &str,
+        key: &str,
+        max_bytes: u32,
+    ) -> Result<Option<Vec<u8>>, cdk::cdk_database::Error> {
+        self.ffi_db
+            .kv_read_bounded(
+                primary_namespace.to_string(),
+                secondary_namespace.to_string(),
+                key.to_string(),
+                max_bytes,
             )
             .await
             .map_err(|e| cdk::cdk_database::Error::Database(e.to_string().into()))
@@ -461,6 +623,59 @@ impl CdkWalletDatabase<cdk::cdk_database::Error> for WalletDatabaseBridge {
             .collect::<Result<Vec<_>, _>>()?)
     }
 
+    async fn get_unissued_mint_quotes_page(
+        &self,
+        mint_url: cdk::mint_url::MintUrl,
+        unit: cdk::nuts::CurrencyUnit,
+        after: Option<String>,
+        limit: u16,
+    ) -> Result<Vec<cdk::wallet::MintQuote>, cdk::cdk_database::Error> {
+        use cdk_common::database::{wallet::MAX_MINT_QUOTE_PAGE_SIZE, Error};
+        if !(1..=MAX_MINT_QUOTE_PAGE_SIZE).contains(&limit) {
+            return Err(Error::Internal("Invalid mint quote page limit".into()));
+        }
+        let page = self
+            .ffi_db
+            .get_unissued_mint_quotes_page(
+                mint_url.clone().into(),
+                unit.clone().into(),
+                after.clone(),
+                limit,
+            )
+            .await
+            .map_err(|err| Error::Database(err.to_string().into()))?;
+        let quotes = match page {
+            MintQuotePage::Rows { quotes } => quotes,
+            MintQuotePage::TooLarge { bytes, limit } => {
+                return Err(Error::MintQuotePageTooLarge { bytes, limit })
+            }
+        };
+        if quotes.len() > usize::from(limit) {
+            return Err(Error::Internal(
+                "Mint quote page exceeds requested limit".into(),
+            ));
+        }
+        let mut previous = after;
+        quotes
+            .into_iter()
+            .map(|quote| {
+                let native: cdk::wallet::MintQuote = quote
+                    .try_into()
+                    .map_err(|err: FfiError| Error::Database(err.to_string().into()))?;
+                if native.mint_url != mint_url
+                    || native.unit != unit
+                    || previous.as_ref().is_some_and(|id| &native.id <= id)
+                {
+                    return Err(Error::Internal(
+                        "Mint quote page violates its scope or cursor".into(),
+                    ));
+                }
+                previous = Some(native.id.clone());
+                Ok(native)
+            })
+            .collect()
+    }
+
     // Melt Quote Management
     async fn get_melt_quote(
         &self,
@@ -538,45 +753,13 @@ impl CdkWalletDatabase<cdk::cdk_database::Error> for WalletDatabaseBridge {
             .await
             .map_err(|e| cdk::cdk_database::Error::Database(e.to_string().into()))?;
 
-        // Convert back to CDK ProofInfo
-        let cdk_result: Result<Vec<cdk::types::ProofInfo>, cdk::cdk_database::Error> = result
+        result
             .into_iter()
             .map(|info| {
-                Ok(cdk::types::ProofInfo {
-                    proof: info.proof.try_into().map_err(|e: FfiError| {
-                        cdk::cdk_database::Error::Database(e.to_string().into())
-                    })?,
-                    y: info.y.try_into().map_err(|e: FfiError| {
-                        cdk::cdk_database::Error::Database(e.to_string().into())
-                    })?,
-                    mint_url: info.mint_url.try_into().map_err(|e: FfiError| {
-                        cdk::cdk_database::Error::Database(e.to_string().into())
-                    })?,
-                    state: info.state.into(),
-                    spending_condition: info
-                        .spending_condition
-                        .map(|sc| sc.try_into())
-                        .transpose()
-                        .map_err(|e: FfiError| {
-                            cdk::cdk_database::Error::Database(e.to_string().into())
-                        })?,
-                    unit: info.unit.into(),
-                    derivation_index: info.derivation_index,
-                    used_by_operation: info
-                        .used_by_operation
-                        .map(|id| uuid::Uuid::parse_str(&id))
-                        .transpose()
-                        .map_err(|e| cdk::cdk_database::Error::Database(e.to_string().into()))?,
-                    created_by_operation: info
-                        .created_by_operation
-                        .map(|id| uuid::Uuid::parse_str(&id))
-                        .transpose()
-                        .map_err(|e| cdk::cdk_database::Error::Database(e.to_string().into()))?,
-                })
+                info.try_into()
+                    .map_err(|e: FfiError| cdk::cdk_database::Error::Database(e.to_string().into()))
             })
-            .collect();
-
-        cdk_result
+            .collect()
     }
 
     async fn get_proofs_by_ys(
@@ -591,45 +774,32 @@ impl CdkWalletDatabase<cdk::cdk_database::Error> for WalletDatabaseBridge {
             .await
             .map_err(|e| cdk::cdk_database::Error::Database(e.to_string().into()))?;
 
-        // Convert back to CDK ProofInfo
-        let cdk_result: Result<Vec<cdk::types::ProofInfo>, cdk::cdk_database::Error> = result
+        result
             .into_iter()
             .map(|info| {
-                Ok(cdk::types::ProofInfo {
-                    proof: info.proof.try_into().map_err(|e: FfiError| {
-                        cdk::cdk_database::Error::Database(e.to_string().into())
-                    })?,
-                    y: info.y.try_into().map_err(|e: FfiError| {
-                        cdk::cdk_database::Error::Database(e.to_string().into())
-                    })?,
-                    mint_url: info.mint_url.try_into().map_err(|e: FfiError| {
-                        cdk::cdk_database::Error::Database(e.to_string().into())
-                    })?,
-                    state: info.state.into(),
-                    spending_condition: info
-                        .spending_condition
-                        .map(|sc| sc.try_into())
-                        .transpose()
-                        .map_err(|e: FfiError| {
-                            cdk::cdk_database::Error::Database(e.to_string().into())
-                        })?,
-                    unit: info.unit.into(),
-                    derivation_index: info.derivation_index,
-                    used_by_operation: info
-                        .used_by_operation
-                        .map(|id| uuid::Uuid::parse_str(&id))
-                        .transpose()
-                        .map_err(|e| cdk::cdk_database::Error::Database(e.to_string().into()))?,
-                    created_by_operation: info
-                        .created_by_operation
-                        .map(|id| uuid::Uuid::parse_str(&id))
-                        .transpose()
-                        .map_err(|e| cdk::cdk_database::Error::Database(e.to_string().into()))?,
-                })
+                info.try_into()
+                    .map_err(|e: FfiError| cdk::cdk_database::Error::Database(e.to_string().into()))
             })
-            .collect();
+            .collect()
+    }
 
-        cdk_result
+    async fn get_unspent_proofs_bounded(
+        &self,
+        mint_url: cdk::mint_url::MintUrl,
+        unit: cdk::nuts::CurrencyUnit,
+        max_proofs: u32,
+        max_bytes: u32,
+    ) -> Result<Vec<cdk::types::ProofInfo>, cdk::cdk_database::Error> {
+        self.ffi_db
+            .get_unspent_proofs_bounded(mint_url.into(), unit.into(), max_proofs, max_bytes)
+            .await
+            .map_err(|e| cdk::cdk_database::Error::Database(e.to_string().into()))?
+            .into_iter()
+            .map(|info| {
+                info.try_into()
+                    .map_err(|e: FfiError| cdk::cdk_database::Error::Database(e.to_string().into()))
+            })
+            .collect()
     }
 
     async fn get_balance(
@@ -774,6 +944,18 @@ impl CdkWalletDatabase<cdk::cdk_database::Error> for WalletDatabaseBridge {
             .map_err(|e| cdk::cdk_database::Error::Database(e.to_string().into()))
     }
 
+    async fn compare_and_swap_proofs(
+        &self,
+        changes: Vec<cdk_common::database::wallet::ProofChange>,
+        expected_saga: Option<&WalletSaga>,
+    ) -> Result<bool, cdk::cdk_database::Error> {
+        let saga = expected_saga.map(serde_json::to_string).transpose()?;
+        self.ffi_db
+            .compare_and_swap_proofs(changes.into_iter().map(Into::into).collect(), saga)
+            .await
+            .map_err(|e| cdk::cdk_database::Error::Database(e.to_string().into()))
+    }
+
     async fn update_proofs_state(
         &self,
         ys: Vec<cdk::nuts::PublicKey>,
@@ -791,6 +973,9 @@ impl CdkWalletDatabase<cdk::cdk_database::Error> for WalletDatabaseBridge {
         &self,
         transaction: cdk::wallet::types::Transaction,
     ) -> Result<(), cdk::cdk_database::Error> {
+        transaction
+            .validate_role()
+            .map_err(|e| cdk::cdk_database::Error::Internal(e.to_string()))?;
         let ffi_transaction = transaction.into();
         self.ffi_db
             .add_transaction(ffi_transaction)
@@ -867,6 +1052,40 @@ impl CdkWalletDatabase<cdk::cdk_database::Error> for WalletDatabaseBridge {
         let ffi_keysets: Vec<KeySetInfo> = keysets.into_iter().map(Into::into).collect();
         self.ffi_db
             .add_mint_keysets(ffi_mint_url, ffi_keysets)
+            .await
+            .map_err(|e| cdk::cdk_database::Error::Database(e.to_string().into()))
+    }
+
+    async fn prepare_output_keyset(
+        &self,
+        operation_id: uuid::Uuid,
+        mint_url: cdk::mint_url::MintUrl,
+        keyset: cdk::nuts::KeySet,
+    ) -> Result<(), cdk::cdk_database::Error> {
+        self.ffi_db
+            .prepare_output_keyset(operation_id.to_string(), mint_url.into(), keyset.into())
+            .await
+            .map_err(|e| cdk::cdk_database::Error::Database(e.to_string().into()))
+    }
+
+    async fn prepare_saga_outputs(
+        &self,
+        expected: Option<&WalletSaga>,
+        next: WalletSaga,
+        keyset: cdk::nuts::KeySet,
+        counter_start: u32,
+        counter_count: u32,
+        receipt: Option<cdk_common::wallet::Transaction>,
+    ) -> Result<bool, cdk::cdk_database::Error> {
+        self.ffi_db
+            .prepare_saga_outputs(
+                expected.map(serde_json::to_string).transpose()?,
+                serde_json::to_string(&next)?,
+                keyset.into(),
+                counter_start,
+                counter_count,
+                receipt.map(Into::into),
+            )
             .await
             .map_err(|e| cdk::cdk_database::Error::Database(e.to_string().into()))
     }
@@ -972,11 +1191,74 @@ impl CdkWalletDatabase<cdk::cdk_database::Error> for WalletDatabaseBridge {
             .map_err(|e| cdk::cdk_database::Error::Database(e.to_string().into()))
     }
 
+    fn supports_atomic_issue_retirement(&self) -> bool {
+        self.ffi_db.supports_atomic_issue_retirement()
+    }
+
+    fn supports_atomic_melt_completion(&self) -> bool {
+        self.ffi_db.supports_atomic_melt_completion()
+    }
+
+    async fn complete_melt(
+        &self,
+        expected: &WalletSaga,
+        next: WalletSaga,
+        quote: &cdk_common::wallet::MeltQuote,
+    ) -> Result<bool, cdk::cdk_database::Error> {
+        cdk_common::database::wallet::validate_melt_completion(expected, &next, quote)?;
+        self.ffi_db
+            .complete_melt(
+                serde_json::to_string(expected)?,
+                serde_json::to_string(&next)?,
+                quote.clone().into(),
+            )
+            .await
+            .map_err(|e| cdk::cdk_database::Error::Database(e.to_string().into()))
+    }
+
+    fn supports_atomic_saga_completion(&self) -> bool {
+        self.ffi_db.supports_atomic_saga_completion()
+    }
+
+    async fn complete_saga(
+        &self,
+        expected: &WalletSaga,
+        next: WalletSaga,
+        receipt: cdk_common::wallet::Transaction,
+    ) -> Result<bool, cdk::cdk_database::Error> {
+        self.ffi_db
+            .complete_saga(
+                serde_json::to_string(expected)?,
+                serde_json::to_string(&next)?,
+                receipt.into(),
+            )
+            .await
+            .map_err(|e| cdk::cdk_database::Error::Database(e.to_string().into()))
+    }
+
     async fn delete_saga(&self, id: &uuid::Uuid) -> Result<(), cdk::cdk_database::Error> {
         self.ffi_db
             .delete_saga(id.to_string())
             .await
             .map_err(|e| cdk::cdk_database::Error::Database(e.to_string().into()))
+    }
+
+    async fn get_incomplete_saga_ids(
+        &self,
+        after: Option<SagaCursor>,
+        limit: u16,
+    ) -> Result<Vec<SagaCursor>, cdk::cdk_database::Error> {
+        cdk_common::database::wallet::validate_saga_page_request(after, limit)?;
+        let after = after
+            .map(|cursor| serde_json::to_string(&cursor))
+            .transpose()?;
+        self.ffi_db
+            .get_incomplete_saga_ids(after, limit)
+            .await
+            .map_err(|e| cdk::cdk_database::Error::Database(e.to_string().into()))?
+            .into_iter()
+            .map(|json| serde_json::from_str(&json).map_err(Into::into))
+            .collect()
     }
 
     async fn get_incomplete_sagas(&self) -> Result<Vec<WalletSaga>, cdk::cdk_database::Error> {
@@ -1063,6 +1345,60 @@ impl CdkWalletDatabase<cdk::cdk_database::Error> for WalletDatabaseBridge {
                 })
             })
             .collect()
+    }
+
+    async fn retire_issue(
+        &self,
+        expected: &WalletSaga,
+        quotes: &[cdk_common::wallet::MintQuote],
+        proofs: Option<Vec<cdk_common::database::wallet::ProofChange>>,
+    ) -> Result<bool, cdk::cdk_database::Error> {
+        cdk_common::database::wallet::validate_issue_retirement(
+            expected,
+            quotes,
+            proofs.as_deref(),
+        )?;
+        self.ffi_db
+            .retire_issue(
+                serde_json::to_string(expected)?,
+                quotes.iter().cloned().map(Into::into).collect(),
+                proofs.map(|changes| changes.into_iter().map(Into::into).collect()),
+            )
+            .await
+            .map_err(|e| cdk::cdk_database::Error::Database(e.to_string().into()))
+    }
+
+    async fn acquire_issue(
+        &self,
+        saga: &WalletSaga,
+        quotes: &[cdk_common::wallet::MintQuote],
+        keyset: cdk::nuts::KeySet,
+        counter_start: u32,
+        counter_count: u32,
+    ) -> Result<bool, cdk::cdk_database::Error> {
+        cdk_common::database::wallet::validate_issue_acquisition(saga, quotes)?;
+        self.ffi_db
+            .acquire_issue(
+                serde_json::to_string(saga)?,
+                quotes.iter().cloned().map(Into::into).collect(),
+                keyset.into(),
+                counter_start,
+                counter_count,
+            )
+            .await
+            .map_err(|e| cdk::cdk_database::Error::Database(e.to_string().into()))
+    }
+
+    async fn acquire_melt(
+        &self,
+        saga: &WalletSaga,
+        quote: &cdk_common::wallet::MeltQuote,
+    ) -> Result<bool, cdk::cdk_database::Error> {
+        cdk_common::database::wallet::validate_melt_acquisition(saga, quote)?;
+        self.ffi_db
+            .acquire_melt(serde_json::to_string(saga)?, quote.clone().into())
+            .await
+            .map_err(|e| cdk::cdk_database::Error::Database(e.to_string().into()))
     }
 
     async fn reserve_melt_quote(
@@ -1219,6 +1555,23 @@ where
 {
     // ========== Read methods ==========
 
+    async fn get_unspent_proofs_bounded(
+        &self,
+        mint_url: MintUrl,
+        unit: CurrencyUnit,
+        max_proofs: u32,
+        max_bytes: u32,
+    ) -> Result<Vec<ProofInfo>, FfiError> {
+        Ok(self
+            .inner
+            .get_unspent_proofs_bounded(mint_url.try_into()?, unit.into(), max_proofs, max_bytes)
+            .await
+            .map_err(FfiError::internal)?
+            .into_iter()
+            .map(Into::into)
+            .collect())
+    }
+
     async fn get_proofs_by_ys(&self, ys: Vec<PublicKey>) -> Result<Vec<ProofInfo>, FfiError> {
         let cdk_ys: Vec<cdk::nuts::PublicKey> = ys
             .into_iter()
@@ -1300,6 +1653,30 @@ where
             .await
             .map_err(FfiError::internal)?;
         Ok(result.into_iter().map(|q| q.into()).collect())
+    }
+
+    async fn get_unissued_mint_quotes_page(
+        &self,
+        mint_url: MintUrl,
+        unit: CurrencyUnit,
+        after: Option<String>,
+        limit: u16,
+    ) -> Result<MintQuotePage, FfiError> {
+        match self
+            .inner
+            .get_unissued_mint_quotes_page(mint_url.try_into()?, unit.into(), after, limit)
+            .await
+        {
+            Ok(quotes) => Ok(MintQuotePage::Rows {
+                quotes: quotes.into_iter().map(Into::into).collect(),
+            }),
+            Err(err) => match err.into() {
+                cdk_common::database::Error::MintQuotePageTooLarge { bytes, limit } => {
+                    Ok(MintQuotePage::TooLarge { bytes, limit })
+                }
+                other => Err(FfiError::database(other)),
+            },
+        }
     }
 
     async fn get_melt_quote(&self, quote_id: String) -> Result<Option<MeltQuote>, FfiError> {
@@ -1418,6 +1795,19 @@ where
             .map_err(FfiError::internal)
     }
 
+    async fn kv_read_bounded(
+        &self,
+        primary_namespace: String,
+        secondary_namespace: String,
+        key: String,
+        max_bytes: u32,
+    ) -> Result<Option<Vec<u8>>, FfiError> {
+        self.inner
+            .kv_read_bounded(&primary_namespace, &secondary_namespace, &key, max_bytes)
+            .await
+            .map_err(FfiError::internal)
+    }
+
     async fn kv_list(
         &self,
         primary_namespace: String,
@@ -1505,33 +1895,8 @@ where
         added: Vec<ProofInfo>,
         removed_ys: Vec<PublicKey>,
     ) -> Result<(), FfiError> {
-        let cdk_added: Result<Vec<cdk::types::ProofInfo>, FfiError> = added
-            .into_iter()
-            .map(|info| {
-                Ok::<cdk::types::ProofInfo, FfiError>(cdk::types::ProofInfo {
-                    proof: info.proof.try_into()?,
-                    y: info.y.try_into()?,
-                    mint_url: info.mint_url.try_into()?,
-                    state: info.state.into(),
-                    spending_condition: info
-                        .spending_condition
-                        .map(|sc| sc.try_into())
-                        .transpose()?,
-                    unit: info.unit.into(),
-                    derivation_index: info.derivation_index,
-                    used_by_operation: info
-                        .used_by_operation
-                        .map(|id| uuid::Uuid::parse_str(&id))
-                        .transpose()
-                        .map_err(|e| FfiError::internal(e.to_string()))?,
-                    created_by_operation: info
-                        .created_by_operation
-                        .map(|id| uuid::Uuid::parse_str(&id))
-                        .transpose()
-                        .map_err(|e| FfiError::internal(e.to_string()))?,
-                })
-            })
-            .collect();
+        let cdk_added: Result<Vec<cdk::types::ProofInfo>, FfiError> =
+            added.into_iter().map(TryInto::try_into).collect();
         let cdk_added = cdk_added?;
 
         let cdk_removed_ys: Result<Vec<cdk::nuts::PublicKey>, FfiError> =
@@ -1540,6 +1905,24 @@ where
 
         self.inner
             .update_proofs(cdk_added, cdk_removed_ys)
+            .await
+            .map_err(FfiError::internal)
+    }
+
+    async fn compare_and_swap_proofs(
+        &self,
+        changes: Vec<ProofChange>,
+        expected_saga_json: Option<String>,
+    ) -> Result<bool, FfiError> {
+        let changes = changes
+            .into_iter()
+            .map(TryInto::try_into)
+            .collect::<Result<Vec<_>, FfiError>>()?;
+        let saga: Option<WalletSaga> = expected_saga_json
+            .map(|json| serde_json::from_str(&json))
+            .transpose()?;
+        self.inner
+            .compare_and_swap_proofs(changes, saga.as_ref())
             .await
             .map_err(FfiError::internal)
     }
@@ -1645,6 +2028,50 @@ where
             .map_err(FfiError::internal)
     }
 
+    async fn prepare_output_keyset(
+        &self,
+        operation_id: String,
+        mint_url: MintUrl,
+        keyset: KeySet,
+    ) -> Result<(), FfiError> {
+        self.inner
+            .prepare_output_keyset(
+                uuid::Uuid::parse_str(&operation_id).map_err(FfiError::internal)?,
+                mint_url.try_into()?,
+                keyset.try_into()?,
+            )
+            .await
+            .map_err(FfiError::internal)
+    }
+
+    async fn prepare_saga_outputs(
+        &self,
+        expected_json: Option<String>,
+        next_json: String,
+        keyset: KeySet,
+        counter_start: u32,
+        counter_count: u32,
+        receipt: Option<Transaction>,
+    ) -> Result<bool, FfiError> {
+        let expected = expected_json
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()
+            .map_err(FfiError::internal)?;
+        let next = serde_json::from_str(&next_json).map_err(FfiError::internal)?;
+        self.inner
+            .prepare_saga_outputs(
+                expected.as_ref(),
+                next,
+                keyset.try_into()?,
+                counter_start,
+                counter_count,
+                receipt.map(TryInto::try_into).transpose()?,
+            )
+            .await
+            .map_err(FfiError::internal)
+    }
+
     async fn add_mint_quote(&self, quote: MintQuote) -> Result<(), FfiError> {
         let cdk_quote = quote.try_into()?;
         self.inner
@@ -1719,12 +2146,73 @@ where
             .map_err(FfiError::internal)
     }
 
+    fn supports_atomic_issue_retirement(&self) -> bool {
+        self.inner.supports_atomic_issue_retirement()
+    }
+
+    fn supports_atomic_melt_completion(&self) -> bool {
+        self.inner.supports_atomic_melt_completion()
+    }
+
+    async fn complete_melt(
+        &self,
+        expected_json: String,
+        next_json: String,
+        quote: MeltQuote,
+    ) -> Result<bool, FfiError> {
+        let expected = serde_json::from_str(&expected_json).map_err(FfiError::internal)?;
+        let next = serde_json::from_str(&next_json).map_err(FfiError::internal)?;
+        let quote = quote.try_into()?;
+        cdk_common::database::wallet::validate_melt_completion(&expected, &next, &quote)
+            .map_err(FfiError::internal)?;
+        self.inner
+            .complete_melt(&expected, next, &quote)
+            .await
+            .map_err(FfiError::internal)
+    }
+
+    fn supports_atomic_saga_completion(&self) -> bool {
+        self.inner.supports_atomic_saga_completion()
+    }
+
+    async fn complete_saga(
+        &self,
+        expected_json: String,
+        next_json: String,
+        receipt: Transaction,
+    ) -> Result<bool, FfiError> {
+        let expected = serde_json::from_str(&expected_json).map_err(FfiError::internal)?;
+        let next = serde_json::from_str(&next_json).map_err(FfiError::internal)?;
+        self.inner
+            .complete_saga(&expected, next, receipt.try_into()?)
+            .await
+            .map_err(FfiError::internal)
+    }
+
     async fn delete_saga(&self, id: String) -> Result<(), FfiError> {
         let id = uuid::Uuid::parse_str(&id).map_err(FfiError::internal)?;
         self.inner
             .delete_saga(&id)
             .await
             .map_err(FfiError::internal)
+    }
+
+    async fn get_incomplete_saga_ids(
+        &self,
+        after_json: Option<String>,
+        limit: u16,
+    ) -> Result<Vec<String>, FfiError> {
+        let after = after_json
+            .map(|json| serde_json::from_str(&json))
+            .transpose()
+            .map_err(FfiError::internal)?;
+        self.inner
+            .get_incomplete_saga_ids(after, limit)
+            .await
+            .map_err(FfiError::internal)?
+            .into_iter()
+            .map(|cursor| serde_json::to_string(&cursor).map_err(FfiError::internal))
+            .collect()
     }
 
     async fn get_incomplete_sagas(&self) -> Result<Vec<String>, FfiError> {
@@ -1777,6 +2265,71 @@ where
     }
 
     // ========== Quote reservation methods ==========
+
+    async fn retire_issue(
+        &self,
+        saga_json: String,
+        quotes: Vec<MintQuote>,
+        proofs: Option<Vec<ProofChange>>,
+    ) -> Result<bool, FfiError> {
+        let proofs = proofs
+            .map(|changes| {
+                changes
+                    .into_iter()
+                    .map(TryInto::try_into)
+                    .collect::<Result<Vec<_>, FfiError>>()
+            })
+            .transpose()?;
+        let saga = serde_json::from_str(&saga_json).map_err(FfiError::internal)?;
+        let quotes: Vec<cdk_common::wallet::MintQuote> = quotes
+            .into_iter()
+            .map(TryInto::try_into)
+            .collect::<Result<_, _>>()?;
+        cdk_common::database::wallet::validate_issue_retirement(&saga, &quotes, proofs.as_deref())
+            .map_err(FfiError::internal)?;
+        self.inner
+            .retire_issue(&saga, &quotes, proofs)
+            .await
+            .map_err(FfiError::internal)
+    }
+
+    async fn acquire_issue(
+        &self,
+        saga_json: String,
+        quotes: Vec<MintQuote>,
+        keyset: KeySet,
+        counter_start: u32,
+        counter_count: u32,
+    ) -> Result<bool, FfiError> {
+        let saga = serde_json::from_str(&saga_json).map_err(FfiError::internal)?;
+        let quotes: Vec<cdk_common::wallet::MintQuote> = quotes
+            .into_iter()
+            .map(TryInto::try_into)
+            .collect::<Result<_, _>>()?;
+        cdk_common::database::wallet::validate_issue_acquisition(&saga, &quotes)
+            .map_err(FfiError::internal)?;
+        self.inner
+            .acquire_issue(
+                &saga,
+                &quotes,
+                keyset.try_into()?,
+                counter_start,
+                counter_count,
+            )
+            .await
+            .map_err(FfiError::internal)
+    }
+
+    async fn acquire_melt(&self, saga_json: String, quote: MeltQuote) -> Result<bool, FfiError> {
+        let saga = serde_json::from_str(&saga_json).map_err(FfiError::internal)?;
+        let quote = quote.try_into()?;
+        cdk_common::database::wallet::validate_melt_acquisition(&saga, &quote)
+            .map_err(FfiError::internal)?;
+        self.inner
+            .acquire_melt(&saga, &quote)
+            .await
+            .map_err(FfiError::internal)
+    }
 
     async fn reserve_melt_quote(
         &self,
@@ -1835,6 +2388,18 @@ macro_rules! impl_ffi_wallet_database {
         impl WalletDatabase for $wrapper_type {
             // ========== Read methods ==========
 
+            async fn get_unspent_proofs_bounded(
+                &self,
+                mint_url: MintUrl,
+                unit: CurrencyUnit,
+                max_proofs: u32,
+                max_bytes: u32,
+            ) -> Result<Vec<ProofInfo>, FfiError> {
+                self.inner
+                    .get_unspent_proofs_bounded(mint_url, unit, max_proofs, max_bytes)
+                    .await
+            }
+
             async fn get_proofs_by_ys(
                 &self,
                 ys: Vec<PublicKey>,
@@ -1879,6 +2444,18 @@ macro_rules! impl_ffi_wallet_database {
 
             async fn get_unissued_mint_quotes(&self) -> Result<Vec<MintQuote>, FfiError> {
                 self.inner.get_unissued_mint_quotes().await
+            }
+
+            async fn get_unissued_mint_quotes_page(
+                &self,
+                mint_url: MintUrl,
+                unit: CurrencyUnit,
+                after: Option<String>,
+                limit: u16,
+            ) -> Result<$crate::database::MintQuotePage, FfiError> {
+                self.inner
+                    .get_unissued_mint_quotes_page(mint_url, unit, after, limit)
+                    .await
             }
 
             async fn get_melt_quote(
@@ -1946,6 +2523,18 @@ macro_rules! impl_ffi_wallet_database {
                     .await
             }
 
+            async fn kv_read_bounded(
+                &self,
+                primary_namespace: String,
+                secondary_namespace: String,
+                key: String,
+                max_bytes: u32,
+            ) -> Result<Option<Vec<u8>>, FfiError> {
+                self.inner
+                    .kv_read_bounded(primary_namespace, secondary_namespace, key, max_bytes)
+                    .await
+            }
+
             async fn kv_list(
                 &self,
                 primary_namespace: String,
@@ -1987,6 +2576,16 @@ macro_rules! impl_ffi_wallet_database {
                 removed_ys: Vec<PublicKey>,
             ) -> Result<(), FfiError> {
                 self.inner.update_proofs(added, removed_ys).await
+            }
+
+            async fn compare_and_swap_proofs(
+                &self,
+                changes: Vec<$crate::types::ProofChange>,
+                expected_saga_json: Option<String>,
+            ) -> Result<bool, FfiError> {
+                self.inner
+                    .compare_and_swap_proofs(changes, expected_saga_json)
+                    .await
             }
 
             async fn update_proofs_state(
@@ -2052,6 +2651,38 @@ macro_rules! impl_ffi_wallet_database {
                 keysets: Vec<KeySetInfo>,
             ) -> Result<(), FfiError> {
                 self.inner.add_mint_keysets(mint_url, keysets).await
+            }
+
+            async fn prepare_output_keyset(
+                &self,
+                operation_id: String,
+                mint_url: MintUrl,
+                keyset: KeySet,
+            ) -> Result<(), FfiError> {
+                self.inner
+                    .prepare_output_keyset(operation_id, mint_url, keyset)
+                    .await
+            }
+
+            async fn prepare_saga_outputs(
+                &self,
+                expected_json: Option<String>,
+                next_json: String,
+                keyset: KeySet,
+                counter_start: u32,
+                counter_count: u32,
+                receipt: Option<Transaction>,
+            ) -> Result<bool, FfiError> {
+                self.inner
+                    .prepare_saga_outputs(
+                        expected_json,
+                        next_json,
+                        keyset,
+                        counter_start,
+                        counter_count,
+                        receipt,
+                    )
+                    .await
             }
 
             async fn add_mint_quote(&self, quote: MintQuote) -> Result<(), FfiError> {
@@ -2120,8 +2751,50 @@ macro_rules! impl_ffi_wallet_database {
                 self.inner.update_saga(saga_json).await
             }
 
+            fn supports_atomic_issue_retirement(&self) -> bool {
+                self.inner.supports_atomic_issue_retirement()
+            }
+
+            fn supports_atomic_melt_completion(&self) -> bool {
+                self.inner.supports_atomic_melt_completion()
+            }
+
+            async fn complete_melt(
+                &self,
+                expected_json: String,
+                next_json: String,
+                quote: MeltQuote,
+            ) -> Result<bool, FfiError> {
+                self.inner
+                    .complete_melt(expected_json, next_json, quote)
+                    .await
+            }
+
+            fn supports_atomic_saga_completion(&self) -> bool {
+                self.inner.supports_atomic_saga_completion()
+            }
+
+            async fn complete_saga(
+                &self,
+                expected_json: String,
+                next_json: String,
+                receipt: Transaction,
+            ) -> Result<bool, FfiError> {
+                self.inner
+                    .complete_saga(expected_json, next_json, receipt)
+                    .await
+            }
+
             async fn delete_saga(&self, id: String) -> Result<(), FfiError> {
                 self.inner.delete_saga(id).await
+            }
+
+            async fn get_incomplete_saga_ids(
+                &self,
+                after_json: Option<String>,
+                limit: u16,
+            ) -> Result<Vec<String>, FfiError> {
+                self.inner.get_incomplete_saga_ids(after_json, limit).await
             }
 
             async fn get_incomplete_sagas(&self) -> Result<Vec<String>, FfiError> {
@@ -2150,6 +2823,36 @@ macro_rules! impl_ffi_wallet_database {
             }
 
             // ========== Quote reservation methods ==========
+
+            async fn retire_issue(
+                &self,
+                saga_json: String,
+                quotes: Vec<MintQuote>,
+                proofs: Option<Vec<$crate::types::ProofChange>>,
+            ) -> Result<bool, FfiError> {
+                self.inner.retire_issue(saga_json, quotes, proofs).await
+            }
+
+            async fn acquire_issue(
+                &self,
+                saga_json: String,
+                quotes: Vec<MintQuote>,
+                keyset: KeySet,
+                counter_start: u32,
+                counter_count: u32,
+            ) -> Result<bool, FfiError> {
+                self.inner
+                    .acquire_issue(saga_json, quotes, keyset, counter_start, counter_count)
+                    .await
+            }
+
+            async fn acquire_melt(
+                &self,
+                saga_json: String,
+                quote: MeltQuote,
+            ) -> Result<bool, FfiError> {
+                self.inner.acquire_melt(saga_json, quote).await
+            }
 
             async fn reserve_melt_quote(
                 &self,

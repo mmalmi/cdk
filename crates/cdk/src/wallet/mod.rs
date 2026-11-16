@@ -7,7 +7,6 @@ use std::sync::Arc;
 
 use bitcoin::bip32::{ChildNumber, DerivationPath, Xpriv};
 use bitcoin::Network;
-use cdk_common::amount::FeeAndAmounts;
 use cdk_common::database::{self, WalletDatabase};
 use cdk_common::subscription::WalletParams;
 use cdk_common::wallet::{KeysetLoadPolicy, ProofInfo};
@@ -21,7 +20,6 @@ use tokio::sync::RwLock as TokioRwLock;
 use tracing::instrument;
 use zeroize::Zeroize;
 
-use crate::amount::SplitTarget;
 use crate::dhke::construct_proofs;
 use crate::error::Error;
 use crate::fees::calculate_fee;
@@ -56,12 +54,15 @@ mod mint_metadata_cache;
 mod npubcash;
 #[cfg(feature = "nwc")]
 pub mod nwc;
+mod output_plan;
 mod p2pk;
 pub mod payment_request;
+mod proof_states;
 mod proofs;
 mod receive;
 mod reclaim;
 mod recovery;
+#[cfg(test)]
 pub(crate) mod saga;
 mod send;
 #[cfg(not(target_arch = "wasm32"))]
@@ -91,7 +92,7 @@ pub use mint_connector::{
     AuthHttpClient, HttpClient, LnurlPayInvoiceResponse, LnurlPayResponse, MintConnector,
     RateLimitConfig, RateLimiterManager, TokenBucket,
 };
-pub use mint_metadata_cache::MintMetadata;
+pub use mint_metadata_cache::{MintMetadata, MintMetadataLimits};
 #[cfg(feature = "nostr")]
 pub use nostr_backup::{BackupOptions, BackupResult, RestoreOptions, RestoreResult};
 #[cfg(feature = "npubcash")]
@@ -151,6 +152,8 @@ pub struct Wallet {
     pub metadata_cache: Arc<MintMetadataCache>,
     /// The targeted amount of proofs to have at each size
     pub target_proof_count: usize,
+    max_outputs: Option<u32>,
+    proof_inventory_limits: Option<(u32, u32)>,
     auth_wallet: Arc<TokioRwLock<Option<AuthWallet>>>,
     auth_connector: Option<Arc<dyn AuthMintConnector + Send + Sync>>,
     #[cfg(feature = "npubcash")]
@@ -601,72 +604,6 @@ impl Wallet {
             .clone();
 
         Ok(mint_info)
-    }
-
-    /// Get amounts needed to refill proof state
-    #[instrument(skip(self))]
-    pub(crate) async fn amounts_needed_for_state_target(
-        &self,
-        fee_and_amounts: &FeeAndAmounts,
-    ) -> Result<Vec<Amount>, Error> {
-        let unspent_proofs = self
-            .get_proofs_with(Some(vec![State::Unspent]), None)
-            .await?;
-
-        let amounts_count: HashMap<u64, u64> =
-            unspent_proofs
-                .iter()
-                .fold(HashMap::new(), |mut acc, proof| {
-                    let amount = proof.amount;
-                    let counter = acc.entry(u64::from(amount)).or_insert(0);
-                    *counter += 1;
-                    acc
-                });
-
-        let needed_amounts =
-            fee_and_amounts
-                .amounts()
-                .iter()
-                .fold(Vec::new(), |mut acc, amount| {
-                    let count_needed = (self.target_proof_count as u64)
-                        .saturating_sub(*amounts_count.get(amount).unwrap_or(&0));
-
-                    for _i in 0..count_needed {
-                        acc.push(Amount::from(*amount));
-                    }
-
-                    acc
-                });
-        Ok(needed_amounts)
-    }
-
-    /// Determine [`SplitTarget`] for amount based on state
-    #[instrument(skip(self))]
-    async fn determine_split_target_values(
-        &self,
-        change_amount: Amount,
-        fee_and_amounts: &FeeAndAmounts,
-    ) -> Result<SplitTarget, Error> {
-        let mut amounts_needed_refill = self
-            .amounts_needed_for_state_target(fee_and_amounts)
-            .await?;
-
-        amounts_needed_refill.sort();
-
-        let mut values = Vec::new();
-
-        for amount in amounts_needed_refill {
-            let values_sum = Amount::try_sum(values.clone().into_iter())?;
-            if values_sum
-                .checked_add(amount)
-                .ok_or(Error::AmountOverflow)?
-                <= change_amount
-            {
-                values.push(amount);
-            }
-        }
-
-        Ok(SplitTarget::Values(values))
     }
 
     /// Restore proofs from the mint using the NUT-13 spec defaults (batch
@@ -1168,6 +1105,7 @@ mod tests {
     use async_trait::async_trait;
     use bitcoin::bip32::DerivationPath;
     use bitcoin::secp256k1::Secp256k1;
+    use cdk_common::amount::FeeAndAmounts;
     use cdk_common::nut02::KeySetVersion;
     use cdk_common::nuts::{KeySet, KeySetInfo, KeysetResponse, MintKeySet};
 

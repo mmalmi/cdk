@@ -1,9 +1,46 @@
-use cdk_common::wallet::{Transaction, TransactionDirection, TransactionId, TransactionStatus};
+use cdk_common::wallet::{Transaction, TransactionDirection, TransactionId};
 use cdk_common::Proofs;
 
 use crate::{Error, Wallet};
 
 impl Wallet {
+    /// Retire exact completed token history after the caller durably releases
+    /// result/retry rights and preserves accounting. At most 128 records per call.
+    /// Active operations, changed rows or incomplete spent inputs prevent removal.
+    /// Coin records remain intact.
+    pub async fn retire_send_transactions(
+        &self,
+        expected: Vec<Transaction>,
+    ) -> Result<bool, Error> {
+        if expected
+            .iter()
+            .any(|tx| !self.transaction_matches_wallet(tx))
+        {
+            return Err(Error::InvalidOperationState);
+        }
+        Ok(self.localstore.retire_send_transactions(expected).await?)
+    }
+
+    /// Retire exact completed token history after the caller durably releases
+    /// result/retry rights and preserves accounting. At most 128 records per call.
+    /// Active operations, changed rows or incomplete spent inputs prevent removal.
+    /// Coin records remain intact.
+    pub async fn retire_incoming_transactions(
+        &self,
+        expected: Vec<Transaction>,
+    ) -> Result<bool, Error> {
+        if expected
+            .iter()
+            .any(|tx| !self.transaction_matches_wallet(tx))
+        {
+            return Err(Error::InvalidOperationState);
+        }
+        Ok(self
+            .localstore
+            .retire_incoming_transactions(expected)
+            .await?)
+    }
+
     fn transaction_matches_wallet(&self, transaction: &Transaction) -> bool {
         transaction.matches_conditions(
             &Some(self.mint_url.clone()),
@@ -36,86 +73,6 @@ impl Wallet {
         let transaction = self.localstore.get_transaction(id).await?;
 
         Ok(transaction.filter(|transaction| self.transaction_matches_wallet(transaction)))
-    }
-
-    /// Store a transaction without changing its original creation timestamp.
-    pub(crate) async fn upsert_transaction(
-        &self,
-        mut transaction: Transaction,
-    ) -> Result<(), Error> {
-        if let Some(existing) = self.localstore.get_transaction(transaction.id()).await? {
-            transaction.timestamp = existing.timestamp;
-        }
-
-        self.localstore.add_transaction(transaction).await?;
-        Ok(())
-    }
-
-    /// Update the status of the transaction associated with a saga.
-    ///
-    /// Returns `true` when the requested status was applied to at least one
-    /// matching transaction, or a matching transaction already had it.
-    /// Returns `false` when no transaction matches the saga, or every match
-    /// was already in a terminal state and the update was ignored.
-    pub(crate) async fn update_transaction_status_by_saga_id(
-        &self,
-        saga_id: uuid::Uuid,
-        status: TransactionStatus,
-    ) -> Result<bool, Error> {
-        let transaction_id = TransactionId::from_saga_id(saga_id);
-        let transaction = self
-            .localstore
-            .get_transaction(transaction_id)
-            .await?
-            .filter(|transaction| self.transaction_matches_wallet(transaction));
-
-        let transactions = match transaction {
-            Some(transaction) => vec![transaction],
-            None => self
-                .localstore
-                .list_transactions(Some(self.mint_url.clone()), None, Some(self.unit.clone()))
-                .await?
-                .into_iter()
-                .filter(|transaction| transaction.saga_id == Some(saga_id))
-                .collect(),
-        };
-
-        if transactions.is_empty() {
-            return Ok(false);
-        }
-
-        let mut applied = false;
-        for mut transaction in transactions {
-            if transaction.status == status {
-                applied = true;
-                continue;
-            }
-
-            if transaction.status != TransactionStatus::Pending {
-                tracing::warn!(
-                    saga_id = %saga_id,
-                    current_status = %transaction.status,
-                    requested_status = %status,
-                    "Ignoring transaction status change from terminal state"
-                );
-                continue;
-            }
-
-            transaction.status = status;
-            self.localstore.add_transaction(transaction).await?;
-            applied = true;
-        }
-        Ok(applied)
-    }
-
-    /// Mark a saga transaction as failed before compensating it.
-    ///
-    /// Persistence errors are propagated so compensation cannot delete the
-    /// saga before its transaction reaches a durable terminal state.
-    pub(crate) async fn mark_transaction_failed(&self, saga_id: uuid::Uuid) -> Result<(), Error> {
-        self.update_transaction_status_by_saga_id(saga_id, TransactionStatus::Failed)
-            .await?;
-        Ok(())
     }
 
     /// Get proofs for a transaction by transaction ID
@@ -208,9 +165,7 @@ mod tests {
 
     use cdk_common::mint_url::MintUrl;
     use cdk_common::nuts::{CurrencyUnit, State};
-    use cdk_common::wallet::{
-        ProofInfo, Transaction, TransactionDirection, TransactionId, TransactionStatus,
-    };
+    use cdk_common::wallet::{ProofInfo, Transaction, TransactionDirection, TransactionStatus};
     use cdk_common::Amount;
 
     use crate::wallet::test_utils::{
@@ -234,6 +189,7 @@ mod tests {
             .expect("proof should be stored");
 
         let tx_b = Transaction {
+            role: Default::default(),
             mint_url: mint_b,
             direction: TransactionDirection::Outgoing,
             amount: Amount::from(100_u64),
@@ -251,6 +207,7 @@ mod tests {
             status: TransactionStatus::Completed,
         };
         let tx_b_id = tx_b.id();
+        let retirement = tx_b.clone();
         db.add_transaction(tx_b)
             .await
             .expect("transaction should be stored");
@@ -262,228 +219,16 @@ mod tests {
             "wallet returned proofs for another mint's transaction: {:?}",
             returned.map(|proofs| proofs.len())
         );
-    }
-
-    #[tokio::test]
-    async fn terminal_transaction_status_cannot_be_overwritten() {
-        let db = create_test_db().await;
-        let wallet = create_test_wallet(db.clone()).await;
-        let saga_id = uuid::Uuid::new_v4();
-
-        let transaction = Transaction {
-            mint_url: wallet.mint_url.clone(),
-            direction: TransactionDirection::Incoming,
-            amount: Amount::from(100_u64),
-            fee: Amount::ZERO,
-            unit: wallet.unit.clone(),
-            ys: vec![],
-            timestamp: 0,
-            memo: None,
-            metadata: HashMap::new(),
-            quote_id: None,
-            payment_request: None,
-            payment_proof: None,
-            payment_method: None,
-            saga_id: Some(saga_id),
-            status: TransactionStatus::Pending,
-        };
-        db.add_transaction(transaction)
-            .await
-            .expect("transaction should be stored");
-
-        assert!(wallet
-            .update_transaction_status_by_saga_id(saga_id, TransactionStatus::Completed)
-            .await
-            .expect("pending status should update"));
-        assert!(!wallet
-            .update_transaction_status_by_saga_id(saga_id, TransactionStatus::Failed)
-            .await
-            .expect("terminal status update should be ignored"));
-
-        let transaction = db
-            .get_transaction(TransactionId::from_saga_id(saga_id))
-            .await
-            .expect("transaction lookup should succeed")
-            .expect("transaction should exist");
-        assert_eq!(transaction.status, TransactionStatus::Completed);
-    }
-
-    fn saga_transaction(
-        wallet: &crate::Wallet,
-        saga_id: uuid::Uuid,
-        status: TransactionStatus,
-        batch_quote_id: Option<&str>,
-    ) -> Transaction {
-        let mut metadata = HashMap::new();
-        if let Some(quote_id) = batch_quote_id {
-            metadata.insert("batch_quote_id".to_string(), quote_id.to_string());
-        }
-
-        Transaction {
-            mint_url: wallet.mint_url.clone(),
-            direction: TransactionDirection::Incoming,
-            amount: Amount::from(100_u64),
-            fee: Amount::ZERO,
-            unit: wallet.unit.clone(),
-            ys: vec![],
-            timestamp: 0,
-            memo: None,
-            metadata,
-            quote_id: None,
-            payment_request: None,
-            payment_proof: None,
-            payment_method: None,
-            saga_id: Some(saga_id),
-            status,
-        }
-    }
-
-    #[tokio::test]
-    async fn status_update_returns_false_for_unknown_saga() {
-        let db = create_test_db().await;
-        let wallet = create_test_wallet(db.clone()).await;
-
-        assert!(!wallet
-            .update_transaction_status_by_saga_id(
-                uuid::Uuid::new_v4(),
-                TransactionStatus::Completed
-            )
-            .await
-            .expect("update for unknown saga should succeed"));
-    }
-
-    #[tokio::test]
-    async fn batch_quote_transactions_are_updated_via_saga_fallback() {
-        let db = create_test_db().await;
-        let wallet = create_test_wallet(db.clone()).await;
-        let saga_id = uuid::Uuid::new_v4();
-
-        // Batch-quote transactions derive their ID from the saga ID and quote
-        // ID, so the direct `from_saga_id` lookup misses and the saga-ID
-        // fallback scan must find them.
-        for quote_id in ["quote-a", "quote-b"] {
-            let transaction =
-                saga_transaction(&wallet, saga_id, TransactionStatus::Pending, Some(quote_id));
-            assert_ne!(
-                transaction.id(),
-                TransactionId::from_saga_id(saga_id),
-                "batch quote transaction must not use the plain saga ID"
-            );
-            db.add_transaction(transaction)
-                .await
-                .expect("transaction should be stored");
-        }
-
-        assert!(wallet
-            .update_transaction_status_by_saga_id(saga_id, TransactionStatus::Completed)
-            .await
-            .expect("batch quote transactions should update"));
-
-        for quote_id in ["quote-a", "quote-b"] {
-            let transaction = db
-                .get_transaction(TransactionId::from_batch_quote(saga_id, quote_id))
-                .await
-                .expect("transaction lookup should succeed")
-                .expect("transaction should exist");
-            assert_eq!(transaction.status, TransactionStatus::Completed);
-        }
-    }
-
-    #[tokio::test]
-    async fn mixed_terminal_and_pending_transactions_update_only_pending() {
-        let db = create_test_db().await;
-        let wallet = create_test_wallet(db.clone()).await;
-        let saga_id = uuid::Uuid::new_v4();
-
-        db.add_transaction(saga_transaction(
-            &wallet,
-            saga_id,
-            TransactionStatus::Completed,
-            Some("quote-done"),
-        ))
-        .await
-        .expect("transaction should be stored");
-        db.add_transaction(saga_transaction(
-            &wallet,
-            saga_id,
-            TransactionStatus::Pending,
-            Some("quote-pending"),
-        ))
-        .await
-        .expect("transaction should be stored");
-
-        assert!(wallet
-            .update_transaction_status_by_saga_id(saga_id, TransactionStatus::Failed)
-            .await
-            .expect("pending transaction should update"));
-
-        let terminal = db
-            .get_transaction(TransactionId::from_batch_quote(saga_id, "quote-done"))
-            .await
-            .expect("transaction lookup should succeed")
-            .expect("transaction should exist");
-        assert_eq!(
-            terminal.status,
-            TransactionStatus::Completed,
-            "terminal transaction must not be overwritten"
-        );
-
-        let pending = db
-            .get_transaction(TransactionId::from_batch_quote(saga_id, "quote-pending"))
-            .await
-            .expect("transaction lookup should succeed")
-            .expect("transaction should exist");
-        assert_eq!(pending.status, TransactionStatus::Failed);
-    }
-
-    #[tokio::test]
-    async fn status_update_returns_false_when_all_matches_are_terminal() {
-        let db = create_test_db().await;
-        let wallet = create_test_wallet(db.clone()).await;
-        let saga_id = uuid::Uuid::new_v4();
-
-        for quote_id in ["quote-a", "quote-b"] {
-            db.add_transaction(saga_transaction(
-                &wallet,
-                saga_id,
-                TransactionStatus::Completed,
-                Some(quote_id),
-            ))
-            .await
-            .expect("transaction should be stored");
-        }
-
-        assert!(!wallet
-            .update_transaction_status_by_saga_id(saga_id, TransactionStatus::Failed)
-            .await
-            .expect("terminal status updates should be ignored"));
-    }
-
-    #[tokio::test]
-    async fn status_update_to_current_status_reports_applied() {
-        let db = create_test_db().await;
-        let wallet = create_test_wallet(db.clone()).await;
-        let saga_id = uuid::Uuid::new_v4();
-
-        db.add_transaction(saga_transaction(
-            &wallet,
-            saga_id,
-            TransactionStatus::Completed,
-            None,
-        ))
-        .await
-        .expect("transaction should be stored");
-
-        assert!(wallet
-            .update_transaction_status_by_saga_id(saga_id, TransactionStatus::Completed)
-            .await
-            .expect("matching status should report applied"));
-
-        let transaction = db
-            .get_transaction(TransactionId::from_saga_id(saga_id))
-            .await
-            .expect("transaction lookup should succeed")
-            .expect("transaction should exist");
-        assert_eq!(transaction.status, TransactionStatus::Completed);
+        assert!(matches!(
+            wallet
+                .retire_send_transactions(vec![retirement.clone()])
+                .await,
+            Err(crate::Error::InvalidOperationState)
+        ));
+        assert!(matches!(
+            wallet.retire_incoming_transactions(vec![retirement]).await,
+            Err(crate::Error::InvalidOperationState)
+        ));
+        assert!(db.get_transaction(tx_b_id).await.unwrap().is_some());
     }
 }

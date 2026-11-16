@@ -72,3 +72,60 @@ pub(crate) async fn validate_mint_response_signatures<'a>(
 
     Ok(())
 }
+
+/// Check stored secrets against every original blinded output before using them.
+pub(crate) fn validate_saved_outputs(
+    secrets: &crate::nuts::PreMintSecrets,
+    outputs: &[BlindedMessage],
+) -> Result<(), Error> {
+    if secrets.secrets.is_empty() || outputs.len() != secrets.secrets.len() {
+        return Err(Error::InvalidOperationState);
+    }
+    let mut seen = std::collections::HashSet::new();
+    for (secret, output) in secrets.secrets.iter().zip(outputs) {
+        let (blinded, _) =
+            crate::dhke::blind_message(secret.secret.as_bytes(), Some(secret.r.clone()))?;
+        if blinded != output.blinded_secret
+            || *output != secret.blinded_message
+            || secret.amount != output.amount
+            || output.keyset_id != secrets.keyset_id
+            || !seen.insert(blinded)
+        {
+            return Err(Error::InvalidOperationState);
+        }
+    }
+    Ok(())
+}
+
+/// Require complete restore coverage and order signatures by the original outputs.
+pub(crate) fn ordered_restore_signatures(
+    expected: &[BlindedMessage],
+    restored: crate::nuts::RestoreResponse,
+) -> Result<Vec<BlindSignature>, Error> {
+    let invalid =
+        || Error::InvalidMintResponse("restore does not match every original output".to_owned());
+    if restored.outputs.len() != expected.len() || restored.signatures.len() != expected.len() {
+        return Err(invalid());
+    }
+    let mut signatures = std::collections::HashMap::new();
+    for (output, signature) in restored.outputs.into_iter().zip(restored.signatures) {
+        if signatures
+            .insert(output.blinded_secret, (output, signature))
+            .is_some()
+        {
+            return Err(invalid());
+        }
+    }
+    expected
+        .iter()
+        .map(|output| {
+            let (actual, signature) = signatures
+                .remove(&output.blinded_secret)
+                .ok_or_else(invalid)?;
+            if actual != *output {
+                return Err(invalid());
+            }
+            Ok(signature)
+        })
+        .collect()
+}

@@ -13,21 +13,34 @@ use crate::nuts::{
 use crate::{ensure_cdk, Amount, Error, Wallet};
 
 impl Wallet {
-    pub(crate) async fn unspent_proof_derivation_indices(
-        &self,
-    ) -> Result<HashMap<Proof, u32>, Error> {
-        Ok(self
-            .localstore
-            .get_proofs(
-                Some(self.mint_url.clone()),
-                Some(self.unit.clone()),
-                Some(vec![State::Unspent]),
-                None,
-            )
-            .await?
-            .into_iter()
-            .filter_map(|proof| proof.derivation_index.map(|index| (proof.proof, index)))
-            .collect())
+    pub(crate) async fn unspent_inventory(&self) -> Result<Vec<ProofInfo>, Error> {
+        match self.proof_inventory_limits {
+            Some((max_proofs, max_bytes)) => Ok(self
+                .localstore
+                .get_unspent_proofs_bounded(
+                    self.mint_url.clone(),
+                    self.unit.clone(),
+                    max_proofs,
+                    max_bytes,
+                )
+                .await?),
+            None => Ok(self
+                .localstore
+                .get_proofs(
+                    Some(self.mint_url.clone()),
+                    Some(self.unit.clone()),
+                    Some(vec![State::Unspent]),
+                    None,
+                )
+                .await?),
+        }
+    }
+
+    pub(crate) fn proof_derivation_indices(proofs: &[ProofInfo]) -> HashMap<Proof, u32> {
+        proofs
+            .iter()
+            .filter_map(|row| row.derivation_index.map(|index| (row.proof.clone(), index)))
+            .collect()
     }
 
     /// Get unspent proofs for mint
@@ -91,26 +104,52 @@ impl Wallet {
         Ok(())
     }
 
-    /// NUT-07 Check the state of a [`Proof`] with the mint
+    /// Query NUT-07 states in proof order without changing local wallet records.
+    ///
+    /// Unknown local proofs are supported. The complete response must match the
+    /// requested identities and mint-visible states. An Unspent answer does not
+    /// authenticate a proof signature or guarantee it cannot later be spent.
+    #[instrument(skip(self, proofs))]
+    pub async fn check_proofs_state(&self, proofs: Proofs) -> Result<Vec<ProofState>, Error> {
+        let ys = proofs.ys()?;
+        let response = self
+            .client
+            .post_check_state(CheckStateRequest { ys: ys.clone() })
+            .await?;
+        super::proof_states::validate(&ys, &response.states)?;
+        Ok(response.states)
+    }
+
+    /// Query NUT-07 states and retain known spent proofs as recovery evidence.
+    ///
+    /// Only confirmed-spent states are changed. Unknown proofs are not imported,
+    /// and the complete response is validated before changing local records.
     #[instrument(skip(self, proofs))]
     pub async fn check_proofs_spent(&self, proofs: Proofs) -> Result<Vec<ProofState>, Error> {
-        let spendable = self
-            .client
-            .post_check_state(CheckStateRequest { ys: proofs.ys()? })
-            .await?;
-
-        let spent_ys: Vec<_> = spendable
-            .states
+        let states = self.check_proofs_state(proofs).await?;
+        let spent_ys: Vec<_> = states
             .iter()
-            .filter_map(|p| match p.state {
-                State::Spent => Some(p.y),
-                _ => None,
-            })
+            .filter(|p| p.state == State::Spent)
+            .map(|p| p.y)
             .collect();
-
-        self.localstore.update_proofs(vec![], spent_ys).await?;
-
-        Ok(spendable.states)
+        if !spent_ys.is_empty() {
+            // Unknown restored proofs have no local record to update. Preserve
+            // existing ownership and derivation metadata instead of importing
+            // queried proofs or deleting the evidence of a completed spend.
+            let known_ys = self
+                .localstore
+                .get_proofs_by_ys(spent_ys)
+                .await?
+                .into_iter()
+                .map(|p| p.y)
+                .collect::<Vec<_>>();
+            if !known_ys.is_empty() {
+                self.localstore
+                    .update_proofs_state(known_ys, State::Spent)
+                    .await?;
+            }
+        }
+        Ok(states)
     }
 
     /// Checks pending proofs for spent status and marks spent proofs accordingly.
@@ -178,19 +217,12 @@ impl Wallet {
             .map(|s| s.y)
             .collect();
 
-        let (pending_proofs, non_pending_proofs): (Vec<ProofInfo>, Vec<ProofInfo>) =
+        let amount = Amount::try_sum(
             orphaned_proofs
-                .into_iter()
-                .partition(|p| pending_states.contains(&p.y));
-
-        let amount = Amount::try_sum(pending_proofs.iter().map(|p| p.proof.amount))?;
-
-        self.localstore
-            .update_proofs(
-                vec![],
-                non_pending_proofs.into_iter().map(|p| p.y).collect(),
-            )
-            .await?;
+                .iter()
+                .filter(|p| pending_states.contains(&p.y))
+                .map(|p| p.proof.amount),
+        )?;
 
         balance += amount;
 
@@ -314,7 +346,20 @@ impl Wallet {
             // Still need to filter to minimum set, not return all of them
             let mut inactive_selected = selected_proofs.into_iter().collect::<Vec<_>>();
             Self::sort_proofs_by_amount_and_age(&mut inactive_selected, derivation_indices);
-            return Self::select_least_amount_over(inactive_selected, amount, derivation_indices);
+            let selected =
+                Self::select_least_amount_over(inactive_selected, amount, derivation_indices)?;
+            return if include_fees {
+                Self::include_fees(
+                    amount,
+                    proofs,
+                    selected,
+                    active_keyset_ids,
+                    fees_and_keyset_amounts,
+                    derivation_indices,
+                )
+            } else {
+                Ok(selected)
+            };
         }
         let mut remaining_amounts: Vec<Amount> = Vec::new();
 
@@ -421,10 +466,15 @@ impl Wallet {
             }
         }
 
+        // Halving can miss usable non-power-of-two denominations. In that case,
+        // choose from the full balance instead of rejecting funds or undersending.
+        if selected_proofs.total_amount()? < amount {
+            selected_proofs.extend(proofs.iter().cloned());
+        }
+
         // Check if the selected proofs total amount is equal to the amount else filter out unnecessary proofs
         let mut selected_proofs = selected_proofs.into_iter().collect::<Vec<_>>();
-        let total_amount = selected_proofs.total_amount()?;
-        if total_amount != amount && selected_proofs.len() > 1 {
+        if selected_proofs.total_amount()? != amount {
             Self::sort_proofs_by_amount_and_age(&mut selected_proofs, derivation_indices);
             selected_proofs =
                 Self::select_least_amount_over(selected_proofs, amount, derivation_indices)?;
@@ -676,6 +726,65 @@ mod tests {
             id(),
             (0, (0..32).map(|x| 2u64.pow(x)).collect::<Vec<_>>()).into(),
         )])
+    }
+
+    #[test]
+    fn test_select_proofs_non_power_of_two_denominations() {
+        use std::collections::HashSet;
+
+        use cdk_common::nuts::nut00::ProofsMethods;
+
+        use crate::fees::calculate_fee;
+
+        for (denominations, amounts, requested) in [
+            (vec![1, 3, 5], vec![3, 3, 1], 5),
+            (
+                vec![1, 960, 1024],
+                [vec![960, 960], vec![1; 193]].concat(),
+                1024,
+            ),
+        ] {
+            let proofs: Vec<_> = amounts.into_iter().map(proof).collect();
+            for fee in [0, 100] {
+                let fees = HashMap::from([(id(), (fee, denominations.clone()).into())]);
+                for include_fees in [false, true] {
+                    let selected = Wallet::select_proofs(
+                        requested.into(),
+                        proofs.clone(),
+                        &vec![id()],
+                        &fees,
+                        include_fees,
+                    )
+                    .unwrap();
+                    let cost = if include_fees {
+                        calculate_fee(&selected.count_by_keyset(), &HashMap::from([(id(), fee)]))
+                            .unwrap()
+                            .total
+                    } else {
+                        Amount::ZERO
+                    };
+                    assert!(selected.total_amount().unwrap() >= Amount::from(requested) + cost);
+                    assert!(selected.iter().all(|p| proofs.contains(p)));
+                    assert_eq!(
+                        selected.iter().collect::<HashSet<_>>().len(),
+                        selected.len()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_select_proofs_rejects_duplicate_balance() {
+        let coin = proof(3);
+        let result = Wallet::select_proofs(
+            5.into(),
+            vec![coin.clone(), coin, proof(1)],
+            &vec![id()],
+            &HashMap::from([(id(), (0, vec![1, 3, 5]).into())]),
+            false,
+        );
+        assert!(matches!(result, Err(crate::Error::InsufficientFunds)));
     }
 
     #[test]

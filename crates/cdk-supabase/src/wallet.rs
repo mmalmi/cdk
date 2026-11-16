@@ -1,3 +1,6 @@
+#[cfg(test)]
+mod saga_pages_tests;
+
 use std::collections::HashMap;
 use std::fmt;
 use std::str::FromStr;
@@ -22,8 +25,8 @@ use cdk_common::redact::url_for_logs;
 use cdk_common::secret::Secret;
 use cdk_common::util::hex;
 use cdk_common::wallet::{
-    self, MintQuote, Transaction, TransactionDirection, TransactionId, TransactionStatus,
-    WalletSaga,
+    self, MintQuote, Transaction, TransactionDirection, TransactionId, TransactionRole,
+    TransactionStatus, WalletSaga,
 };
 use reqwest::{Client, StatusCode};
 use scrypt::Params as ScryptParams;
@@ -243,7 +246,7 @@ impl SupabaseWalletDatabase {
     /// This must match the latest `schema_version` value set in the migration files.
     /// When adding new migrations, update this constant and set the same value
     /// in the new migration's `INSERT INTO schema_info` statement.
-    pub const REQUIRED_SCHEMA_VERSION: u32 = 10;
+    pub const REQUIRED_SCHEMA_VERSION: u32 = 11;
 
     /// Get the full database schema SQL
     ///
@@ -1530,6 +1533,27 @@ impl Database<DatabaseError> for SupabaseWalletDatabase {
         keyset_id: &Id,
         count: u32,
     ) -> Result<u32, DatabaseError> {
+        if count == 0 {
+            #[derive(Deserialize)]
+            struct Counter {
+                counter: u32,
+            }
+            let path = format!(
+                "rest/v1/keyset_counter?keyset_id=eq.{}&select=counter&limit=1",
+                url_encode(&keyset_id.to_string())
+            );
+            let (status, text) = self.get_request(&path).await?;
+            if !status.is_success() {
+                return Err(DatabaseError::Internal(format!(
+                    "read keyset counter failed: HTTP {}",
+                    status
+                )));
+            }
+            return Ok(Self::parse_response::<Counter>(&text)?
+                .and_then(|rows| rows.into_iter().next())
+                .map(|row| row.counter)
+                .unwrap_or(0));
+        }
         // Use Supabase RPC for atomic increment
         // This calls the increment_keyset_counter PostgreSQL function
         let rpc_body = serde_json::json!({
@@ -2031,6 +2055,42 @@ impl Database<DatabaseError> for SupabaseWalletDatabase {
             )));
         }
         Ok(())
+    }
+
+    async fn get_incomplete_saga_ids(
+        &self,
+        after: Option<cdk_common::database::wallet::SagaCursor>,
+        limit: u16,
+    ) -> Result<Vec<cdk_common::database::wallet::SagaCursor>, DatabaseError> {
+        use cdk_common::database::wallet::{validate_saga_page_request, SagaCursor};
+
+        validate_saga_page_request(after, limit)?;
+        let mut path = format!("rest/v1/saga?completed=eq.false&select=id,created_at&order=created_at.asc,id.asc&limit={limit}");
+        if let Some(after) = after {
+            path.push_str(&format!(
+                "&or=(created_at.gt.{0},and(created_at.eq.{0},id.gt.{1}))",
+                after.created_at, after.id
+            ));
+        }
+        let (status, text) = self.get_request(&path).await?;
+        if !status.is_success() {
+            return Err(DatabaseError::Internal(format!(
+                "get_incomplete_saga_ids failed: HTTP {status}"
+            )));
+        }
+        let page: Vec<SagaCursor> = serde_json::from_str(&text)?;
+        if page.len() > usize::from(limit) {
+            return Err(DatabaseError::InvalidDbResponse);
+        }
+        let mut previous = after;
+        for cursor in &page {
+            validate_saga_page_request(Some(*cursor), limit)?;
+            if previous.is_some_and(|last| *cursor <= last) {
+                return Err(DatabaseError::InvalidDbResponse);
+            }
+            previous = Some(*cursor);
+        }
+        Ok(page)
     }
 
     async fn get_incomplete_sagas(&self) -> Result<Vec<WalletSaga>, DatabaseError> {
@@ -2944,6 +3004,8 @@ impl TryFrom<ProofInfo> for ProofTable {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct TransactionTable {
+    #[serde(default)]
+    role: TransactionRole,
     id: String,
     mint_url: String,
     direction: String,
@@ -2972,7 +3034,7 @@ impl TryInto<Transaction> for TransactionTable {
     fn try_into(self) -> Result<Transaction, Self::Error> {
         let id_bytes = hex::decode(&self.id)
             .map_err(|_| DatabaseError::Internal("Invalid transaction id hex".into()))?;
-        let _id_arr: [u8; 32] = id_bytes
+        let id_arr: [u8; 32] = id_bytes
             .try_into()
             .map_err(|_| DatabaseError::Internal("Invalid transaction id len".into()))?;
 
@@ -2987,7 +3049,8 @@ impl TryInto<Transaction> for TransactionTable {
             None => vec![],
         };
 
-        Ok(Transaction {
+        let transaction = Transaction {
+            role: self.role,
             mint_url: MintUrl::from_str(&self.mint_url)
                 .map_err(|e| DatabaseError::Internal(e.to_string()))?,
             direction: TransactionDirection::from_str(&self.direction)
@@ -3020,14 +3083,27 @@ impl TryInto<Transaction> for TransactionTable {
                 .map_err(|_| DatabaseError::Internal("Invalid saga_id uuid".into()))?,
             status: TransactionStatus::from_str(&self.status)
                 .map_err(|_| DatabaseError::Internal("Invalid transaction status".into()))?,
-        })
+        };
+        transaction
+            .validate_role()
+            .map_err(|e| DatabaseError::Internal(e.to_string()))?;
+        if transaction.role == TransactionRole::SendRefund && transaction.id().as_slice() != id_arr
+        {
+            return Err(DatabaseError::Internal(
+                "Invalid send refund transaction ID".into(),
+            ));
+        }
+        Ok(transaction)
     }
 }
 
 impl TryFrom<Transaction> for TransactionTable {
     type Error = DatabaseError;
     fn try_from(t: Transaction) -> Result<Self, Self::Error> {
+        t.validate_role()
+            .map_err(|e| DatabaseError::Internal(e.to_string()))?;
         Ok(Self {
+            role: t.role,
             id: t.id().to_string(),
             mint_url: t.mint_url.to_string(),
             direction: t.direction.to_string(),
@@ -3335,6 +3411,42 @@ mod tests {
         fn assert_wallet_database<T: WalletDatabase<DatabaseError>>() {}
 
         assert_wallet_database::<SupabaseWalletDatabase>();
+    }
+
+    #[test]
+    fn refund_transaction_table_roundtrip_validates_identity() {
+        let transaction = Transaction {
+            role: TransactionRole::SendRefund,
+            mint_url: "https://mint.example.com".parse().unwrap(),
+            direction: TransactionDirection::Incoming,
+            status: TransactionStatus::Completed,
+            amount: 7.into(),
+            fee: 1.into(),
+            unit: CurrencyUnit::Sat,
+            ys: vec![cdk_common::SecretKey::generate().public_key()],
+            timestamp: 42,
+            memo: None,
+            metadata: HashMap::new(),
+            quote_id: None,
+            payment_request: None,
+            payment_proof: None,
+            payment_method: None,
+            saga_id: Some(uuid::Uuid::new_v4()),
+        };
+        let table = TransactionTable::try_from(transaction.clone()).unwrap();
+        let json = serde_json::to_value(table).unwrap();
+        assert_eq!(json["role"], "send_refund");
+        let restored: Transaction = serde_json::from_value::<TransactionTable>(json)
+            .unwrap()
+            .try_into()
+            .unwrap();
+        assert_eq!(restored, transaction);
+        let mut table = TransactionTable::try_from(transaction.clone()).unwrap();
+        table.id = TransactionId::from_saga_id(transaction.saga_id.unwrap()).to_string();
+        assert!(TryInto::<Transaction>::try_into(table).is_err());
+        let mut malformed = transaction;
+        malformed.saga_id = None;
+        assert!(TransactionTable::try_from(malformed).is_err());
     }
 
     #[test]

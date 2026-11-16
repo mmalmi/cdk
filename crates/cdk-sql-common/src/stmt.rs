@@ -208,6 +208,22 @@ pub struct Statement {
 }
 
 impl Statement {
+    /// Inspect the exact scalar binding used by a row writer.
+    #[cfg(feature = "wallet")]
+    pub(crate) fn bound_value(&self, name: &str) -> Result<&Column, Error> {
+        self.parts
+            .iter()
+            .find_map(|part| match part {
+                SqlPart::Placeholder(key, Some(PlaceholderValue::Value(value)))
+                    if key.as_ref() == name =>
+                {
+                    Some(value)
+                }
+                _ => None,
+            })
+            .ok_or_else(|| Error::MissingPlaceholder(name.to_owned()))
+    }
+
     /// Creates a new statement
     fn new(sql: &str, cache: Arc<RwLock<Cache>>) -> Result<Self, SqlParseError> {
         let parsed = cache

@@ -75,6 +75,7 @@ pub use cdk_http_client::ws as ws_client;
 #[cfg(feature = "http")]
 pub use cdk_http_client::{
     fetch, HttpClient, HttpClientBuilder, HttpError, RawResponse, RequestBuilder, Response,
+    MAX_RESPONSE_BYTES,
 };
 // Re-export common types
 pub use common::FinalizedMelt;

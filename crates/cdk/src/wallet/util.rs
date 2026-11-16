@@ -5,11 +5,41 @@ use std::fmt;
 use std::str::FromStr;
 
 use bitcoin::XOnlyPublicKey;
+use cdk_common::database::wallet::ProofChange;
 use cdk_common::terminal::escape_control;
+use cdk_common::wallet::ProofInfo;
 
 use crate::nuts::nut10::Kind;
 use crate::nuts::{Conditions, Proof, Proofs, PublicKey, SecretKey};
 use crate::{Error, SECP256K1};
+
+/// Compare the immutable coin identity while retaining newer local evidence.
+pub(crate) fn same_coin(a: &Proof, b: &Proof) -> bool {
+    a.amount == b.amount && a.keyset_id == b.keyset_id && a.secret == b.secret && a.c == b.c
+}
+
+/// Retain later state and evidence only for the same original output and provenance.
+pub(crate) fn output_change(
+    output: ProofInfo,
+    current: Option<&ProofInfo>,
+) -> Result<ProofChange, Error> {
+    if let Some(current) = current {
+        if !same_coin(&current.proof, &output.proof)
+            || current.mint_url != output.mint_url
+            || current.unit != output.unit
+            || current.spending_condition != output.spending_condition
+            || current.created_by_operation != output.created_by_operation
+            || current.derivation_index != output.derivation_index
+        {
+            return Err(Error::ConcurrentUpdate);
+        }
+    }
+    Ok(ProofChange {
+        y: output.y,
+        before: current.cloned(),
+        after: Some(current.cloned().unwrap_or(output)),
+    })
+}
 
 /// Render a value without allowing terminal controls to reach a log sink.
 pub(crate) fn escape_log_value<T>(value: &T) -> String

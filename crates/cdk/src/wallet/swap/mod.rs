@@ -9,26 +9,13 @@ use tracing::instrument;
 use crate::amount::SplitTarget;
 use crate::fees::ProofsFeeBreakdown;
 use crate::nuts::nut00::ProofsMethods;
-use crate::nuts::{PreMintSecrets, PreSwap, Proofs, PublicKey, SpendingConditions, SwapRequest};
+use crate::nuts::{PreMintSecrets, PreSwap, Proofs, SpendingConditions, SwapRequest};
 use crate::{Amount, Error, Wallet};
 
+pub(crate) mod outputs;
 pub(crate) mod saga;
 
 use saga::SwapSaga;
-
-/// Controls whether swap operations should reserve proofs in the database.
-///
-/// When a swap is performed as a nested operation within a parent saga
-/// (send, melt, receive), the parent has already reserved the proofs.
-/// Passing [`ProofReservation::Skip`] avoids a double-reservation conflict
-/// that would otherwise fail with `ProofNotUnspent`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ProofReservation {
-    /// Reserve proofs as part of the swap (default for standalone swaps).
-    Reserve,
-    /// Skip reservation because a parent saga already reserved these proofs.
-    Skip,
-}
 
 impl Wallet {
     /// Swap proofs using the saga pattern.
@@ -45,85 +32,26 @@ impl Wallet {
         include_fees: bool,
         use_p2bk: bool,
     ) -> Result<Option<Proofs>, Error> {
-        self.swap_internal(
-            amount,
-            amount_split_target,
-            input_proofs,
-            spending_conditions,
-            include_fees,
-            use_p2bk,
-            ProofReservation::Reserve,
-        )
-        .await
-    }
-
-    /// Swap proofs without reserving them first.
-    ///
-    /// This is intended for internal use by parent sagas (send, melt, receive)
-    /// that have already reserved the proofs. Calling this on unreserved proofs
-    /// bypasses the reservation safety check.
-    #[instrument(skip(self, input_proofs))]
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn swap_no_reserve(
-        &self,
-        amount: Option<Amount>,
-        amount_split_target: SplitTarget,
-        input_proofs: Proofs,
-        spending_conditions: Option<SpendingConditions>,
-        include_fees: bool,
-        use_p2bk: bool,
-    ) -> Result<Option<Proofs>, Error> {
-        self.swap_internal(
-            amount,
-            amount_split_target,
-            input_proofs,
-            spending_conditions,
-            include_fees,
-            use_p2bk,
-            ProofReservation::Skip,
-        )
-        .await
-    }
-
-    /// Internal swap implementation with explicit proof reservation control.
-    #[allow(clippy::too_many_arguments)]
-    async fn swap_internal(
-        &self,
-        amount: Option<Amount>,
-        amount_split_target: SplitTarget,
-        input_proofs: Proofs,
-        spending_conditions: Option<SpendingConditions>,
-        include_fees: bool,
-        use_p2bk: bool,
-        proof_reservation: ProofReservation,
-    ) -> Result<Option<Proofs>, Error> {
         tracing::info!("Swapping");
 
-        self.retry_on_inactive_keyset(|| async {
-            let saga = SwapSaga::new(self);
-            let saga = saga
-                .prepare(
-                    amount,
-                    amount_split_target.clone(),
-                    input_proofs.clone(),
-                    spending_conditions.clone(),
-                    use_p2bk,
-                    include_fees,
-                    proof_reservation,
-                )
-                .await?;
-            let saga = saga.execute().await?;
-            Ok(saga.into_send_proofs())
-        })
-        .await
+        let saga = SwapSaga::new(self)
+            .prepare(
+                amount,
+                amount_split_target,
+                input_proofs,
+                spending_conditions,
+                use_p2bk,
+                include_fees,
+            )
+            .await?;
+        Ok(saga.execute().await?.into_send_proofs())
     }
 
-    /// Create Swap Payload
+    /// Construct a private swap proposal without reserving inputs or outputs.
     #[instrument(skip(self, proofs))]
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn create_swap(
         &self,
-        operation_id: &uuid::Uuid,
         active_keyset_id: Id,
         fee_and_amounts: &FeeAndAmounts,
         amount: Option<Amount>,
@@ -133,17 +61,12 @@ impl Wallet {
         include_fees: bool,
         use_p2bk: bool,
         proofs_fee_breakdown: &ProofsFeeBreakdown,
-        proof_reservation: ProofReservation,
+        starting_counter: u32,
     ) -> Result<PreSwap, Error> {
         tracing::info!("Creating swap");
 
         // Desired amount is either amount passed or value of all proof
         let proofs_total = proofs.total_amount()?;
-
-        if proof_reservation == ProofReservation::Reserve {
-            let ys: Vec<PublicKey> = proofs.ys()?;
-            self.localstore.reserve_proofs(ys, operation_id).await?;
-        }
 
         let total_to_subtract = amount
             .unwrap_or(Amount::ZERO)
@@ -158,11 +81,10 @@ impl Wallet {
             true => {
                 let split_count = amount
                     .unwrap_or(Amount::ZERO)
-                    .split_targeted(&SplitTarget::default(), fee_and_amounts)?
-                    .len();
+                    .split_count(fee_and_amounts)?;
 
                 let fee_to_redeem = self
-                    .get_keyset_count_fee(&active_keyset_id, split_count as u64)
+                    .get_keyset_count_fee(&active_keyset_id, split_count)
                     .await?;
 
                 (
@@ -177,6 +99,11 @@ impl Wallet {
             false => (amount, change_amount),
         };
 
+        let send_count = send_amount
+            .unwrap_or(Amount::ZERO)
+            .split_count(fee_and_amounts)?;
+        self.check_output_count(send_count)?;
+
         // If a non None split target is passed use that
         // else use state refill
         let change_split_target = match amount_split_target {
@@ -189,44 +116,23 @@ impl Wallet {
 
         let derived_secret_count;
 
-        // Calculate total secrets needed and atomically reserve counter range
-        let total_secrets_needed = match spending_conditions {
-            Some(_) => {
-                // For spending conditions, we only need to count change secrets
-                change_amount
-                    .split_targeted(&change_split_target, fee_and_amounts)?
-                    .len() as u32
-            }
-            None => {
-                // For no spending conditions, count both send and change secrets
-                let send_count = send_amount
-                    .unwrap_or(Amount::ZERO)
-                    .split_targeted(&SplitTarget::default(), fee_and_amounts)?
-                    .len() as u32;
-                let change_count = change_amount
-                    .split_targeted(&change_split_target, fee_and_amounts)?
-                    .len() as u32;
-                send_count + change_count
-            }
-        };
-
-        // Atomically get the counter range we need
-        let starting_counter = if total_secrets_needed > 0 {
-            tracing::debug!(
-                "Incrementing keyset {} counter by {}",
-                active_keyset_id,
-                total_secrets_needed
-            );
-
-            let new_counter = self
-                .localstore
-                .increment_keyset_counter(&active_keyset_id, total_secrets_needed)
-                .await?;
-
-            new_counter - total_secrets_needed
+        let change_count =
+            change_amount.split_targeted_count(&change_split_target, fee_and_amounts)?;
+        let output_count = self.check_output_count(
+            send_count
+                .checked_add(change_count)
+                .ok_or(Error::AmountOverflow)?,
+        )?;
+        let total_secrets_needed = if spending_conditions.is_some() {
+            u32::try_from(change_count).map_err(|_| Error::AmountOverflow)?
         } else {
-            0
+            output_count
         };
+
+        // The caller publishes this private range with its recovery plan.
+        starting_counter
+            .checked_add(total_secrets_needed)
+            .ok_or(Error::AmountOverflow)?;
 
         let mut count = starting_counter;
 
@@ -249,10 +155,7 @@ impl Wallet {
                         let is_sig_all = conditions
                             .as_ref()
                             .is_some_and(|c| c.sig_flag == crate::nuts::nut11::SigFlag::SigAll);
-                        let amount_split = send_amount
-                            .unwrap_or(Amount::ZERO)
-                            .split_targeted(&SplitTarget::default(), fee_and_amounts)?;
-                        let keys_count = if is_sig_all { 1 } else { amount_split.len() };
+                        let keys_count = if is_sig_all { 1 } else { send_count as usize };
                         let ephemeral_keys: Vec<_> = (0..keys_count)
                             .map(|_| crate::nuts::nut01::SecretKey::generate())
                             .collect();
@@ -346,10 +249,9 @@ mod tests {
     };
     use crate::Error;
 
-    /// When the mint returns InactiveKeyset on a swap and the active keyset
-    /// has rotated, the wallet should retry the swap with the new keyset.
+    /// A final inactive-keyset response cannot exclude an earlier successful retry.
     #[tokio::test]
-    async fn swap_retries_on_inactive_keyset_after_rotation() {
+    async fn inactive_keyset_after_submission_retains_exact_request_and_inputs() {
         let db = create_test_db().await;
         let mint_url = test_mint_url();
         db.add_mint(mint_url.clone(), None).await.unwrap();
@@ -384,12 +286,9 @@ mod tests {
         old.active = Some(false);
         let mut rotated = make_inactive_keyset();
         rotated.active = Some(true);
-        let keyset_b_id = rotated.id;
         mock.set_mint_keys_response(Ok(vec![old, rotated]));
 
-        // First post_swap → InactiveKeyset, second → TokenAlreadySpent
-        // (we can't construct valid blind signatures, so use a different error
-        // to prove the retry happened)
+        // A final rejection may follow a successful internal connector retry.
         mock.push_post_swap_response(Err(Error::InactiveKeyset));
         mock.push_post_swap_response(Err(Error::TokenAlreadySpent));
 
@@ -404,30 +303,25 @@ mod tests {
             )
             .await;
 
-        // The second attempt's error should surface, not InactiveKeyset
-        assert!(
-            matches!(result, Err(Error::TokenAlreadySpent)),
-            "expected TokenAlreadySpent from retry, got: {result:?}"
-        );
-
+        assert!(matches!(result, Err(Error::InactiveKeyset)));
         let requests = mock.captured_swap_requests();
-        assert_eq!(requests.len(), 2, "post_swap should be called twice");
-
-        // First attempt targeted keyset A
-        assert!(
-            requests[0]
-                .outputs()
-                .iter()
-                .all(|o| o.keyset_id == keyset_a_id),
-            "first swap attempt should target keyset A"
+        assert_eq!(
+            requests.len(),
+            1,
+            "do not create a new request after submission"
         );
-        // Second attempt targeted keyset B
-        assert!(
-            requests[1]
-                .outputs()
-                .iter()
-                .all(|o| o.keyset_id == keyset_b_id),
-            "second swap attempt should target keyset B"
+        assert!(requests[0]
+            .outputs()
+            .iter()
+            .all(|o| o.keyset_id == keyset_a_id));
+        let saved = db.get_incomplete_sagas().await.unwrap();
+        assert_eq!(saved.len(), 1);
+        let cdk_common::wallet::OperationData::Swap(data) = &saved[0].data else {
+            panic!("swap");
+        };
+        assert_eq!(
+            data.checkpoint.as_ref().unwrap().pre_swap.swap_request,
+            requests[0]
         );
 
         let stored = db.get_proofs_by_ys(proof_ys).await.unwrap();

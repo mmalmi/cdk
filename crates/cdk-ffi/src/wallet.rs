@@ -86,6 +86,13 @@ impl Wallet {
             .seed(seed)
             .target_proof_count(config.target_proof_count.unwrap_or(3) as usize);
 
+        if let Some(maximum) = config.max_outputs {
+            builder = builder.with_max_outputs(maximum);
+        }
+        if let Some(limits) = config.proof_inventory_limits {
+            builder = builder.with_proof_inventory_limits(limits.max_proofs, limits.max_bytes);
+        }
+
         if let Some(config) = pace_with {
             builder = builder.with_rate_limiting_config(config);
         }
@@ -203,6 +210,8 @@ impl Wallet {
     }
 
     /// Receive tokens.
+    /// Completed retries require `options.replay_completed` and return the
+    /// retained original amount without new credit.
     ///
     /// This verifies and persists received proofs in the local store. Mobile
     /// hosts should avoid starting it during app background transitions unless
@@ -239,6 +248,8 @@ impl Wallet {
     }
 
     /// Receive proofs directly.
+    /// Completed retries require `options.replay_completed` and return the
+    /// retained original amount without new credit.
     ///
     /// This verifies and persists received proofs in the local store. Mobile
     /// hosts should avoid starting it during app background transitions unless
@@ -267,7 +278,55 @@ impl Wallet {
         Ok(sends.into_iter().map(|id| id.to_string()).collect())
     }
 
-    /// Revoke a pending send operation
+    /// Resume one persisted send confirmation without processing other operations.
+    pub async fn recover_send_confirmation(&self, operation_id: String) -> Result<(), FfiError> {
+        let uuid = uuid::Uuid::parse_str(&operation_id)
+            .map_err(|e| FfiError::internal(format!("Invalid operation ID: {}", e)))?;
+        self.inner.recover_send_confirmation(uuid).await?;
+        Ok(())
+    }
+
+    /// Cancel an exact preparation with retained zero-spend evidence.
+    pub async fn cancel_prepared_send(
+        &self,
+        operation_id: String,
+        amount: Amount,
+        inputs: Vec<Proof>,
+    ) -> Result<(), FfiError> {
+        let uuid = uuid::Uuid::parse_str(&operation_id)
+            .map_err(|e| FfiError::internal(format!("Invalid operation ID: {}", e)))?;
+        let inputs = inputs
+            .into_iter()
+            .map(TryInto::try_into)
+            .collect::<Result<Vec<_>, _>>()?;
+        self.inner
+            .cancel_prepared_send(uuid, amount.into(), inputs)
+            .await?;
+        Ok(())
+    }
+
+    /// Acknowledge a cancellation after durably recording its result.
+    pub async fn acknowledge_prepared_cancellation(
+        &self,
+        operation_id: String,
+        amount: Amount,
+        inputs: Vec<Proof>,
+    ) -> Result<(), FfiError> {
+        let uuid = uuid::Uuid::parse_str(&operation_id)
+            .map_err(|e| FfiError::internal(format!("Invalid operation ID: {}", e)))?;
+        let inputs = inputs
+            .into_iter()
+            .map(TryInto::try_into)
+            .collect::<Result<Vec<_>, _>>()?;
+        self.inner
+            .acknowledge_prepared_cancellation(uuid, amount.into(), inputs)
+            .await?;
+        Ok(())
+    }
+
+    /// Revoke a pending send operation and return the amount after the reclaim fee.
+    ///
+    /// Retries resume the saved request or return its retained refund receipt.
     pub async fn revoke_send(&self, operation_id: String) -> Result<Amount, FfiError> {
         let uuid = uuid::Uuid::parse_str(&operation_id)
             .map_err(|e| FfiError::internal(format!("Invalid operation ID: {}", e)))?;
@@ -638,7 +697,22 @@ impl Wallet {
         Ok(all_proofs)
     }
 
-    /// Check if proofs are spent
+    /// Query mint states in proof order without changing local wallet records.
+    pub async fn check_proofs_state(&self, proofs: Proofs) -> Result<Vec<ProofState>, FfiError> {
+        let proofs = proofs
+            .into_iter()
+            .map(TryInto::try_into)
+            .collect::<Result<_, _>>()?;
+        Ok(self
+            .inner
+            .check_proofs_state(proofs)
+            .await?
+            .into_iter()
+            .map(|proof| proof.state.into())
+            .collect())
+    }
+
+    /// Check if proofs are spent, retaining confirmed-spent records for recovery.
     pub async fn check_proofs_spent(&self, proofs: Proofs) -> Result<Vec<bool>, FfiError> {
         let cdk_proofs: Result<Vec<cdk::nuts::Proof>, _> =
             proofs.into_iter().map(|p| p.try_into()).collect();
@@ -666,6 +740,32 @@ impl Wallet {
         let cdk_direction = direction.map(Into::into);
         let transactions = self.inner.list_transactions(cdk_direction).await?;
         Ok(transactions.into_iter().map(Into::into).collect())
+    }
+
+    /// Retire exact completed token history after the caller durably releases
+    /// result rights and preserves accounting. Coin records remain intact.
+    pub async fn retire_send_transactions(
+        &self,
+        expected: Vec<Transaction>,
+    ) -> Result<bool, FfiError> {
+        let expected = expected
+            .into_iter()
+            .map(TryInto::try_into)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(self.inner.retire_send_transactions(expected).await?)
+    }
+
+    /// Retire exact completed token history after the caller durably releases
+    /// result rights and preserves accounting. Coin records remain intact.
+    pub async fn retire_incoming_transactions(
+        &self,
+        expected: Vec<Transaction>,
+    ) -> Result<bool, FfiError> {
+        let expected = expected
+            .into_iter()
+            .map(TryInto::try_into)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(self.inner.retire_incoming_transactions(expected).await?)
     }
 
     /// Get transaction by ID
@@ -1101,10 +1201,25 @@ impl RateLimit {
     }
 }
 
+/// Bounds for unspent coin inventory used in new-operation planning.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct ProofInventoryLimits {
+    /// Maximum number of stored unspent proofs in this mint and unit.
+    pub max_proofs: u32,
+    /// Maximum aggregate stored payload size before decoding.
+    pub max_bytes: u32,
+}
+
 /// Configuration for creating wallets
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct WalletConfig {
     pub target_proof_count: Option<u32>,
+    /// Maximum newly created outputs per swap or mint request, including change.
+    #[uniffi(default = None)]
+    pub max_outputs: Option<u32>,
+    /// Row and stored-byte limits for new-operation inventory reads.
+    #[uniffi(default = None)]
+    pub proof_inventory_limits: Option<ProofInventoryLimits>,
     /// Client-side request pacing to start with. Omit it to keep the built-in
     /// default, which paces the wallet under a mint's per-minute request cap.
     ///
@@ -1149,6 +1264,8 @@ mod tests {
             custom_wallet_store(db),
             WalletConfig {
                 target_proof_count: None,
+                max_outputs: None,
+                proof_inventory_limits: None,
                 rate_limit,
             },
         )

@@ -14,6 +14,8 @@ use thiserror::Error;
 use crate::nuts::CurrencyUnit;
 use crate::Id;
 
+mod split;
+
 /// Amount Error
 #[derive(Debug, Error)]
 pub enum Error {
@@ -192,139 +194,6 @@ impl Amount<()> {
             value: self.value,
             unit,
         }
-    }
-
-    /// Split into parts using the available denominations
-    ///
-    /// Uses a greedy algorithm starting from the largest denomination,
-    /// taking as many of each denomination as possible before moving
-    /// to the next smaller one.
-    ///
-    /// Returns an error if the amount cannot be fully represented
-    /// with the available denominations.
-    pub fn split(&self, fee_and_amounts: &FeeAndAmounts) -> Result<Vec<Self>, Error> {
-        if fee_and_amounts.amounts.contains(&0) {
-            return Err(Error::InvalidAmount(
-                "denominations must be greater than zero".to_owned(),
-            ));
-        }
-
-        let parts: Vec<Self> = fee_and_amounts
-            .amounts
-            .iter()
-            .rev()
-            .fold((Vec::new(), self.value), |(mut acc, total), &amount| {
-                let count = total / amount;
-                for _ in 0..count {
-                    acc.push(Self::from(amount));
-                }
-                (acc, total % amount)
-            })
-            .0;
-
-        let sum: u64 = parts.iter().map(|a| a.value).sum();
-        if sum != self.value {
-            return Err(Error::CannotSplitAmount(self.value, sum));
-        }
-
-        Ok(parts)
-    }
-
-    /// Split into parts that are powers of two by target
-    pub fn split_targeted(
-        &self,
-        target: &SplitTarget,
-        fee_and_amounts: &FeeAndAmounts,
-    ) -> Result<Vec<Self>, Error> {
-        let mut parts = match target {
-            SplitTarget::None => self.split(fee_and_amounts)?,
-            SplitTarget::Value(amount) => {
-                if amount.eq(&Amount::ZERO) {
-                    return Err(Error::InvalidAmount(
-                        "SplitTarget::Value amount must be greater than zero".to_owned(),
-                    ));
-                }
-
-                if self.le(amount) {
-                    return self.split(fee_and_amounts);
-                }
-
-                let mut parts_total = Amount::ZERO;
-                let mut parts = Vec::new();
-
-                // The powers of two that are need to create target value
-                let parts_of_value = amount.split(fee_and_amounts)?;
-
-                while parts_total.lt(self) {
-                    for part in parts_of_value.iter().copied() {
-                        if (part.checked_add(parts_total).ok_or(Error::AmountOverflow)?).le(self) {
-                            parts.push(part);
-                        } else {
-                            let amount_left =
-                                self.checked_sub(parts_total).ok_or(Error::AmountOverflow)?;
-                            parts.extend(amount_left.split(fee_and_amounts)?);
-                        }
-
-                        parts_total = Amount::try_sum(parts.clone().iter().copied())?;
-
-                        if parts_total.eq(self) {
-                            break;
-                        }
-                    }
-                }
-
-                parts
-            }
-            SplitTarget::Values(values) => {
-                let values_total: Amount = Amount::try_sum(values.clone())?;
-
-                match self.cmp(&values_total) {
-                    Ordering::Equal => values.clone(),
-                    Ordering::Less => {
-                        return Err(Error::SplitValuesGreater);
-                    }
-                    Ordering::Greater => {
-                        let extra = self
-                            .checked_sub(values_total)
-                            .ok_or(Error::AmountOverflow)?;
-                        let mut extra_amount = extra.split(fee_and_amounts)?;
-                        let mut values = values.clone();
-
-                        values.append(&mut extra_amount);
-                        values
-                    }
-                }
-            }
-        };
-
-        parts.sort();
-        Ok(parts)
-    }
-
-    /// Splits amount into powers of two while accounting for the swap fee
-    pub fn split_with_fee(&self, fee_and_amounts: &FeeAndAmounts) -> Result<Vec<Self>, Error> {
-        let without_fee_amounts = self.split(fee_and_amounts)?;
-        let total_fee_ppk = fee_and_amounts
-            .fee
-            .checked_mul(without_fee_amounts.len() as u64)
-            .ok_or(Error::AmountOverflow)?;
-        let fee = Amount::from(total_fee_ppk.div_ceil(1000));
-        let new_amount = self.checked_add(fee).ok_or(Error::AmountOverflow)?;
-
-        let split = new_amount.split(fee_and_amounts)?;
-        let split_fee_ppk = (split.len() as u64)
-            .checked_mul(fee_and_amounts.fee)
-            .ok_or(Error::AmountOverflow)?;
-        let split_fee = Amount::from(split_fee_ppk.div_ceil(1000));
-
-        if let Some(net_amount) = new_amount.checked_sub(split_fee) {
-            if net_amount >= *self {
-                return Ok(split);
-            }
-        }
-        self.checked_add(Amount::ONE)
-            .ok_or(Error::AmountOverflow)?
-            .split_with_fee(fee_and_amounts)
     }
 
     /// Checked addition for Amount. Returns None if overflow occurs.
@@ -823,9 +692,8 @@ mod tests {
         let fee_and_amounts = (1000, (0..32).map(|x| 2u64.pow(x)).collect::<Vec<_>>()).into();
 
         let split = amount.split_with_fee(&fee_and_amounts).unwrap();
-        // With fee_ppk=1000 (100%), amount 3 requires proofs totaling at least 5
-        // to cover both the amount (3) and fees (~2 for 2 proofs)
-        assert_eq!(split, vec![Amount::from(4), Amount::from(1)]);
+        // One four-sat proof covers the requested three sats and its one-sat fee.
+        assert_eq!(split, vec![Amount::from(4)]);
     }
 
     #[test]
@@ -945,9 +813,8 @@ mod tests {
     }
 
     #[test]
-    fn test_split_with_fee_recursion_limit() {
-        // Test that the recursion doesn't go infinite
-        // This tests the edge case where the method keeps adding Amount::ONE
+    fn test_split_with_fee_extreme_fees() {
+        // Larger denominations can cover fees exceeding the smallest proof value.
         let amount = Amount::from(1);
         let fee_ppk = 10000;
         let fee_and_amounts = (fee_ppk, (0..32).map(|x| 2u64.pow(x)).collect::<Vec<_>>()).into();
@@ -955,7 +822,7 @@ mod tests {
         let result = amount.split_with_fee(&fee_and_amounts);
         assert!(
             result.is_ok(),
-            "split_with_fee should handle extreme fees without infinite recursion"
+            "split_with_fee should find a funded split under extreme fees"
         );
     }
 

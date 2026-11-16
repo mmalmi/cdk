@@ -160,6 +160,20 @@ impl WalletTrait for super::Wallet {
         self.get_transaction(id).await
     }
 
+    async fn retire_send_transactions(
+        &self,
+        expected: Vec<Transaction>,
+    ) -> Result<bool, Self::Error> {
+        self.retire_send_transactions(expected).await
+    }
+
+    async fn retire_incoming_transactions(
+        &self,
+        expected: Vec<Transaction>,
+    ) -> Result<bool, Self::Error> {
+        self.retire_incoming_transactions(expected).await
+    }
+
     #[instrument(skip(self))]
     async fn get_proofs_for_transaction(&self, id: TransactionId) -> Result<Proofs, Self::Error> {
         self.get_proofs_for_transaction(id).await
@@ -178,6 +192,11 @@ impl WalletTrait for super::Wallet {
     #[instrument(skip(self))]
     async fn recover_incomplete_sagas(&self) -> Result<super::RecoveryReport, Self::Error> {
         self.recover_incomplete_sagas().await
+    }
+
+    #[instrument(skip(self, proofs))]
+    async fn check_proofs_state(&self, proofs: Proofs) -> Result<Vec<ProofState>, Self::Error> {
+        self.check_proofs_state(proofs).await
     }
 
     #[instrument(skip(self, proofs))]
@@ -227,6 +246,33 @@ impl WalletTrait for super::Wallet {
     #[instrument(skip(self))]
     async fn get_pending_sends(&self) -> Result<Vec<Uuid>, Self::Error> {
         self.get_pending_sends().await
+    }
+
+    #[instrument(skip_all, err)]
+    async fn recover_send_confirmation(&self, operation_id: Uuid) -> Result<(), Self::Error> {
+        self.recover_send_confirmation(operation_id).await
+    }
+
+    #[instrument(skip_all, err)]
+    async fn cancel_prepared_send(
+        &self,
+        operation_id: Uuid,
+        amount: Amount,
+        inputs: Proofs,
+    ) -> Result<(), Self::Error> {
+        self.cancel_prepared_send(operation_id, amount, inputs)
+            .await
+    }
+
+    #[instrument(skip_all, err)]
+    async fn acknowledge_prepared_cancellation(
+        &self,
+        operation_id: Uuid,
+        amount: Amount,
+        inputs: Proofs,
+    ) -> Result<(), Self::Error> {
+        self.acknowledge_prepared_cancellation(operation_id, amount, inputs)
+            .await
     }
 
     #[instrument(skip(self))]
